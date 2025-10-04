@@ -15,25 +15,12 @@ app.use(express.json());
 // Health check
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ✅ PostgreSQL connection (prefer DB_* env vars and validate)
-const dbHost = String(process.env.DB_HOST ?? process.env.PGHOST ?? 'localhost').trim();
-const dbPort = Number(process.env.DB_PORT ?? process.env.PGPORT ?? 5432);
-const dbName = String(process.env.DB_NAME ?? process.env.PGDATABASE ?? '').trim();
-const dbUser = String(process.env.DB_USER ?? process.env.PGUSER ?? '').trim();
-const dbPassword = String(process.env.DB_PASSWORD ?? process.env.PGPASSWORD ?? '').trim();
-
-if (!dbUser || !dbPassword || !dbName) {
-  console.error('Missing DB config. Set DB_USER, DB_PASSWORD, DB_NAME (or PGUSER/PGPASSWORD/PGDATABASE).');
-  process.exit(1);
-}
 
 const pool = new Pool({
-  host: dbHost,
-  port: dbPort,
-  database: dbName,
-  user: dbUser,
-  password: dbPassword,
-  // ssl: { rejectUnauthorized: false } // uncomment if your DB requires SSL
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false, // Render requires SSL
+  },
 });
 
 // quick connection check - prints clear success or error to server console
