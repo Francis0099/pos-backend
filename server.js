@@ -26,8 +26,8 @@ const pool = new Pool({
 // quick connection check - prints clear success or error to server console
 (async () => {
   try {
-    const r = await pool.query('SELECT 1 AS ok');
-    console.log(`✅ Postgres connected as "${dbUser}" to "${dbName}" (ok=${r.rows[0].ok})`);
+    const r = await pool.query('SELECT NOW()');
+    console.log(`✅ Postgres connected (ok=${r.rows[0].now})`);
   } catch (err) {
     console.error('❌ Postgres connection failed:', err.message || err);
   }
@@ -108,13 +108,13 @@ app.post("/login", async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ success: false, message: "Missing credentials" });
 
-  // DEBUG: show which DB user and env are being used for this request
   console.log("DEBUG /login env:", {
-    DB_USER: process.env.DB_USER,
-    PGUSER: process.env.PGUSER,
-    USER: process.env.USER,
-    effectiveDbUser: dbUser
-  });
+  DATABASE_URL: process.env.DATABASE_URL,
+  DB_USER: process.env.DB_USER,
+  PGUSER: process.env.PGUSER,
+  USER: process.env.USER
+});
+
 
   try {
     const result = await pool.query(
