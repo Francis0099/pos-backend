@@ -998,7 +998,47 @@ app.get("/sales-report", async (req, res) => {
   }
 });
 
-  
+  app.get("/sales-report/category-summary", async (req, res) => {
+  const { period } = req.query;
+
+  // build time filter similar to /sales-report
+  let whereTime = "WHERE 1=1";
+  if (period === "day") {
+    whereTime += " AND DATE(s.created_at) = CURRENT_DATE";
+  } else if (period === "week") {
+    whereTime += " AND DATE_TRUNC('week', s.created_at) = DATE_TRUNC('week', CURRENT_DATE)";
+  } else if (period === "month") {
+    whereTime += " AND DATE_TRUNC('month', s.created_at) = DATE_TRUNC('month', CURRENT_DATE)";
+  }
+
+  try {
+    // per-product within category
+    const sql = `
+      SELECT
+        COALESCE(p.category, 'Uncategorized') AS category,
+        p.id AS product_id,
+        p.name AS product,
+        SUM(si.quantity)::int AS total_sold
+      FROM sale_items si
+      JOIN products p ON si.product_id = p.id
+      JOIN sales s ON si.sale_id = s.id
+      ${whereTime}
+      GROUP BY p.category, p.id, p.name
+      ORDER BY category ASC, total_sold DESC
+    `;
+    const { rows } = await pool.query(sql);
+    // also produce per-category totals (optional)
+    const catTotals = rows.reduce((acc, r) => {
+      const cat = r.category || "Uncategorized";
+      acc[cat] = (acc[cat] || 0) + Number(r.total_sold || 0);
+      return acc;
+    }, {});
+    res.json({ items: rows, categoryTotals: catTotals });
+  } catch (err) {
+    console.error("❌ category-summary error:", err.message || err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
 
 // 📊 Ingredient usage summary report
 app.get("/ingredient-usage-report", async (req, res) => {
@@ -1211,6 +1251,9 @@ app.get('/sales-trend', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Trend fetch failed' });
   }
 });
+
+
+
 
 
 
