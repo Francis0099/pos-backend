@@ -948,27 +948,18 @@ app.get("/sales-report", async (req, res) => {
   const period = String(req.query.period || "day");
 
   try {
-    // bucket expression in Manila time
-    let bucketExpr = "";
+    // choose bucket expression (Manila time)
+    let bucketExpr;
     if (period === "day") {
       bucketExpr = "to_char(timezone('Asia/Manila', s.created_at), 'YYYY-MM-DD')";
     } else if (period === "week") {
-      // return the week-start date (manila) as bucket
       bucketExpr = "to_char(timezone('Asia/Manila', date_trunc('week', s.created_at)), 'YYYY-MM-DD')";
     } else {
-      // month
       bucketExpr = "to_char(timezone('Asia/Manila', s.created_at), 'YYYY-MM')";
     }
 
-    // time filter using Manila "now"
-    let whereTime = "";
-    if (period === "day") {
-      whereTime = "WHERE DATE(timezone('Asia/Manila', s.created_at)) = (now() AT TIME ZONE 'Asia/Manila')::date";
-    } else if (period === "week") {
-      whereTime = "WHERE DATE_TRUNC('week', timezone('Asia/Manila', s.created_at)) = DATE_TRUNC('week', (now() AT TIME ZONE 'Asia/Manila'))";
-    } else {
-      whereTime = "WHERE DATE_TRUNC('month', timezone('Asia/Manila', s.created_at)) = DATE_TRUNC('month', (now() AT TIME ZONE 'Asia/Manila'))";
-    }
+    // return rows for recent window (avoid empty results caused by strict same-day filters)
+    const whereRecent = "WHERE timezone('Asia/Manila', s.created_at) >= (now() AT TIME ZONE 'Asia/Manila') - INTERVAL '90 days'";
 
     const sql = `
       SELECT
@@ -978,7 +969,7 @@ app.get("/sales-report", async (req, res) => {
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.id
       JOIN products p ON si.product_id = p.id
-      ${whereTime}
+      ${whereRecent}
       GROUP BY bucket, p.name
       ORDER BY bucket ASC, total_sold DESC
     `;
@@ -990,7 +981,6 @@ app.get("/sales-report", async (req, res) => {
     res.status(500).json({ success: false, message: "Database error" });
   }
 });
-// ...existing code...
 
   app.get("/sales-report/category-summary", async (req, res) => {
   const { period } = req.query;
