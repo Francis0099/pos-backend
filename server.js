@@ -943,60 +943,54 @@ app.get('/users', async (req, res) => {
 
 
 
+// ...existing code...
 app.get("/sales-report", async (req, res) => {
-  const { period, productId, category } = req.query;
-
-  let selectBucket = "";
-  let groupBy = "";
-  let where = "WHERE 1=1";
-  const params = [];
-
-  // Time filtering
-  if (period === "day") {
-    selectBucket = "EXTRACT(HOUR FROM s.created_at)";
-    groupBy = "EXTRACT(HOUR FROM s.created_at)";
-    where += " AND DATE(s.created_at) = CURRENT_DATE";
-  } else if (period === "week") {
-    selectBucket = "DATE(s.created_at)";
-    groupBy = "DATE(s.created_at)";
-    where += " AND DATE_TRUNC('week', s.created_at) = DATE_TRUNC('week', CURRENT_DATE)";
-  } else {
-    selectBucket = "DATE(s.created_at)";
-    groupBy = "DATE(s.created_at)";
-    where += " AND DATE_TRUNC('month', s.created_at) = DATE_TRUNC('month', CURRENT_DATE)";
-  }
-
-  // Filters
-  if (productId) {
-    params.push(productId);
-    where += ` AND si.product_id = $${params.length}`;
-  }
-  if (category) {
-    params.push(category);
-    where += ` AND p.category = $${params.length}`;
-  }
-
-  const sql = `
-    SELECT 
-      p.name AS product,
-      ${selectBucket} AS bucket,
-      SUM(si.quantity) AS total_sold
-    FROM sale_items si
-    JOIN products p ON si.product_id = p.id
-    JOIN sales s ON si.sale_id = s.id
-    ${where}
-    GROUP BY p.id, ${groupBy}
-    ORDER BY bucket ASC;
-  `;
+  const period = String(req.query.period || "day");
 
   try {
-    const result = await pool.query(sql, params);
-    res.json(result.rows); // ✅ always return array
+    // bucket expression in Manila time
+    let bucketExpr = "";
+    if (period === "day") {
+      bucketExpr = "to_char(timezone('Asia/Manila', s.created_at), 'YYYY-MM-DD')";
+    } else if (period === "week") {
+      // return the week-start date (manila) as bucket
+      bucketExpr = "to_char(timezone('Asia/Manila', date_trunc('week', s.created_at)), 'YYYY-MM-DD')";
+    } else {
+      // month
+      bucketExpr = "to_char(timezone('Asia/Manila', s.created_at), 'YYYY-MM')";
+    }
+
+    // time filter using Manila "now"
+    let whereTime = "";
+    if (period === "day") {
+      whereTime = "WHERE DATE(timezone('Asia/Manila', s.created_at)) = (now() AT TIME ZONE 'Asia/Manila')::date";
+    } else if (period === "week") {
+      whereTime = "WHERE DATE_TRUNC('week', timezone('Asia/Manila', s.created_at)) = DATE_TRUNC('week', (now() AT TIME ZONE 'Asia/Manila'))";
+    } else {
+      whereTime = "WHERE DATE_TRUNC('month', timezone('Asia/Manila', s.created_at)) = DATE_TRUNC('month', (now() AT TIME ZONE 'Asia/Manila'))";
+    }
+
+    const sql = `
+      SELECT
+        ${bucketExpr} AS bucket,
+        p.name AS product,
+        SUM(si.quantity)::int AS total_sold
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.id
+      JOIN products p ON si.product_id = p.id
+      ${whereTime}
+      GROUP BY bucket, p.name
+      ORDER BY bucket ASC, total_sold DESC
+    `;
+
+    const { rows } = await pool.query(sql);
+    res.json(rows);
   } catch (err) {
-    console.error("❌ Sales report fetch error:", err.message);
-    res.status(500).json({ success: false, message: err.message });
+    console.error("❌ /sales-report error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
   }
 });
+// ...existing code...
 
   app.get("/sales-report/category-summary", async (req, res) => {
   const { period } = req.query;
