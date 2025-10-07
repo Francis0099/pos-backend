@@ -942,7 +942,6 @@ app.get('/users', async (req, res) => {
 });
 
 
-
 // ...existing code...
 app.get("/sales-report", async (req, res) => {
   const period = String(req.query.period || "day");
@@ -1237,8 +1236,97 @@ app.get('/sales-trend', async (req, res) => {
 });
 
 
+app.post("/refund-sale", async (req, res) => {
+  const { saleId, items = [], amount = 0, reason = "" } = req.body || {};
+  if (!saleId) return res.status(400).json({ success: false, message: "saleId required" });
 
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
+    // ensure sale exists
+    const saleCheck = await client.query("SELECT id FROM sales WHERE id = $1 LIMIT 1", [saleId]);
+    if (saleCheck.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Sale not found" });
+    }
+
+    // if items not provided, build from sale_items (full-sale refund)
+    let itemsToRefund = Array.isArray(items) && items.length ? items.map(i => ({ productId: Number(i.productId || i.id), quantity: Number(i.quantity || i.qty || 0) })) : [];
+    if (itemsToRefund.length === 0) {
+      const saleItemsRes = await client.query("SELECT product_id, quantity FROM sale_items WHERE sale_id = $1", [saleId]);
+      itemsToRefund = saleItemsRes.rows.map(r => ({ productId: Number(r.product_id), quantity: Number(r.quantity) }));
+    }
+
+    // validate requested refund quantities against sold minus already refunded
+    for (const it of itemsToRefund) {
+      if (!it.productId || it.quantity <= 0) continue;
+      const soldRes = await client.query(
+        "SELECT SUM(quantity) AS sold FROM sale_items WHERE sale_id = $1 AND product_id = $2",
+        [saleId, it.productId]
+      );
+      const sold = Number(soldRes.rows[0]?.sold ?? 0);
+
+      const refundedRes = await client.query(
+        `SELECT COALESCE(SUM(ri.quantity),0) AS refunded
+         FROM refund_items ri
+         JOIN refunds r ON r.id = ri.refund_id
+         WHERE r.sale_id = $1 AND ri.product_id = $2`,
+        [saleId, it.productId]
+      );
+      const alreadyRefunded = Number(refundedRes.rows[0]?.refunded ?? 0);
+
+      const available = sold - alreadyRefunded;
+      if (it.quantity > available) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          message: `Refund quantity for product ${it.productId} exceeds available (${available})`,
+        });
+      }
+    }
+
+    // insert refund record
+    const refundRes = await client.query(
+      "INSERT INTO refunds (sale_id, amount, reason) VALUES ($1, $2, $3) RETURNING id, created_at",
+      [saleId, amount, reason]
+    );
+    const refundId = refundRes.rows[0].id;
+
+    // insert refund_items and restore ingredient stock per product
+    for (const it of itemsToRefund) {
+      if (!it.productId || it.quantity <= 0) continue;
+      await client.query(
+        "INSERT INTO refund_items (refund_id, product_id, quantity) VALUES ($1, $2, $3)",
+        [refundId, it.productId, it.quantity]
+      );
+
+      // restore ingredient stock using product_ingredients mapping
+      const ingrRes = await client.query(
+        "SELECT ingredient_id, amount_needed FROM product_ingredients WHERE product_id = $1",
+        [it.productId]
+      );
+      for (const row of ingrRes.rows) {
+        const restore = Number(row.amount_needed) * it.quantity;
+        if (restore > 0) {
+          await client.query(
+            "UPDATE ingredients SET stock = stock + $1 WHERE id = $2",
+            [restore, row.ingredient_id]
+          );
+        }
+      }
+    }
+
+    await client.query("COMMIT");
+    return res.json({ success: true, refundId });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ /refund-sale error:", err && (err.message || err));
+    return res.status(500).json({ success: false, message: "Refund failed", error: String(err.message || err) });
+  } finally {
+    client.release();
+  }
+});
 
 
 app.get('/test-db', async (req, res) => {
@@ -1256,3 +1344,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
 });
+
