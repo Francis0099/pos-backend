@@ -941,8 +941,74 @@ app.get('/users', async (req, res) => {
   }
 });
 
+// Best sellers (subtract refunded quantities)
+app.get("/best-sellers", async (req, res) => {
+  try {
+    const { month, year, category } = req.query;
+    const m = month ? Number(month) : new Date().getMonth() + 1;
+    const y = year ? Number(year) : new Date().getFullYear();
 
-// ...existing code...
+    const sql = `
+      SELECT
+        p.id,
+        p.name,
+        COALESCE(SUM(GREATEST(si.quantity - COALESCE(ri.refunded_qty,0),0)),0)::int AS total_sold
+      FROM sale_items si
+      JOIN sales s ON s.id = si.sale_id
+      JOIN products p ON p.id = si.product_id
+      LEFT JOIN (
+        SELECT r.sale_id, ri.product_id, SUM(ri.quantity)::int AS refunded_qty
+        FROM refund_items ri
+        JOIN refunds r ON r.id = ri.refund_id
+        GROUP BY r.sale_id, ri.product_id
+      ) ri ON ri.sale_id = si.sale_id AND ri.product_id = si.product_id
+      WHERE EXTRACT(YEAR FROM s.created_at) = $1
+        AND EXTRACT(MONTH FROM s.created_at) = $2
+      ${category ? "AND p.category = $3" : ""}
+      GROUP BY p.id, p.name
+      ORDER BY total_sold DESC
+      LIMIT 20;
+    `;
+    const params = category ? [y, m, category] : [y, m];
+    const { rows } = await pool.query(sql, params);
+    res.json({ month: m, year: y, items: rows });
+  } catch (err) {
+    console.error("best-sellers error:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch best sellers" });
+  }
+});
+
+// Sales report (bucketed) subtracting refunds
+app.get("/sales-report", async (req, res) => {
+  try {
+    const period = (req.query.period || "day").toLowerCase();
+    const trunc = period === "month" ? "month" : period === "week" ? "week" : "day";
+
+    const sql = `
+      SELECT
+        to_char(date_trunc($1, s.created_at), 'YYYY-MM-DD') AS bucket,
+        p.name AS product,
+        COALESCE(SUM(GREATEST(si.quantity - COALESCE(ri.refunded_qty,0),0)),0)::int AS total_sold
+      FROM sale_items si
+      JOIN sales s ON s.id = si.sale_id
+      JOIN products p ON p.id = si.product_id
+      LEFT JOIN (
+        SELECT r.sale_id, ri.product_id, SUM(ri.quantity)::int AS refunded_qty
+        FROM refund_items ri
+        JOIN refunds r ON r.id = ri.refund_id
+        GROUP BY r.sale_id, ri.product_id
+      ) ri ON ri.sale_id = si.sale_id AND ri.product_id = si.product_id
+      WHERE s.created_at >= (now() - interval '1 year')
+      GROUP BY bucket, p.name
+      ORDER BY bucket DESC, total_sold DESC;
+    `;
+    const { rows } = await pool.query(sql, [trunc]);
+    res.json({ items: rows });
+  } catch (err) {
+    console.error("sales-report error:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch sales report" });
+  }
+});
 app.get("/sales-report", async (req, res) => {
   const period = String(req.query.period || "day");
 
@@ -1093,18 +1159,29 @@ app.get('/best-sellers', async (req, res) => {
     const m = month ? Number(month) : (target.getMonth() + 1);
     const y = year ? Number(year) : target.getFullYear();
 
+    // Sum sale_items minus already refunded quantities (refund_items)
+    // refunded_qty is summed per sale + product, then subtracted from sold quantity
     let sql = `
-      SELECT p.id, p.name, SUM(si.quantity) AS total_sold
+      SELECT
+        p.id,
+        p.name,
+        SUM( GREATEST(si.quantity - COALESCE(ri.refunded_qty,0), 0) )::int AS total_sold
       FROM sale_items si
       JOIN sales s ON s.id = si.sale_id
       JOIN products p ON p.id = si.product_id
+      LEFT JOIN (
+        SELECT r.sale_id, ri.product_id, SUM(ri.quantity)::int AS refunded_qty
+        FROM refund_items ri
+        JOIN refunds r ON r.id = ri.refund_id
+        GROUP BY r.sale_id, ri.product_id
+      ) ri ON ri.sale_id = si.sale_id AND ri.product_id = si.product_id
       WHERE EXTRACT(YEAR FROM s.created_at) = $1 AND EXTRACT(MONTH FROM s.created_at) = $2
     `;
     const params = [y, m];
 
-    if (category && category.trim()) {
+    if (category && String(category).trim()) {
       sql += ` AND p.category = $3`;
-      params.push(category.trim());
+      params.push(String(category).trim());
     }
 
     sql += `
