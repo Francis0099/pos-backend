@@ -1314,7 +1314,7 @@ app.get('/sales-trend', async (req, res) => {
 
 
 app.post("/refund-sale", async (req, res) => {
-  const { saleId, items = [], amount = 0, reason = "" } = req.body || {};
+  const { saleId, items = [], amount = 0, reason = "", restock = true } = req.body || {};
   if (!saleId) return res.status(400).json({ success: false, message: "saleId required" });
 
   const client = await pool.connect();
@@ -1370,7 +1370,7 @@ app.post("/refund-sale", async (req, res) => {
     );
     const refundId = refundRes.rows[0].id;
 
-    // insert refund_items and restore ingredient stock per product
+    // insert refund_items and optionally restore ingredient stock per product
     for (const it of itemsToRefund) {
       if (!it.productId || it.quantity <= 0) continue;
       await client.query(
@@ -1378,24 +1378,26 @@ app.post("/refund-sale", async (req, res) => {
         [refundId, it.productId, it.quantity]
       );
 
-      // restore ingredient stock using product_ingredients mapping
-      const ingrRes = await client.query(
-        "SELECT ingredient_id, amount_needed FROM product_ingredients WHERE product_id = $1",
-        [it.productId]
-      );
-      for (const row of ingrRes.rows) {
-        const restore = Number(row.amount_needed) * it.quantity;
-        if (restore > 0) {
-          await client.query(
-            "UPDATE ingredients SET stock = stock + $1 WHERE id = $2",
-            [restore, row.ingredient_id]
-          );
+      // restore ingredient stock only when restock is truthy
+      if (restock) {
+        const ingrRes = await client.query(
+          "SELECT ingredient_id, amount_needed FROM product_ingredients WHERE product_id = $1",
+          [it.productId]
+        );
+        for (const row of ingrRes.rows) {
+          const restore = Number(row.amount_needed) * it.quantity;
+          if (restore > 0) {
+            await client.query(
+              "UPDATE ingredients SET stock = stock + $1 WHERE id = $2",
+              [restore, row.ingredient_id]
+            );
+          }
         }
       }
     }
 
     await client.query("COMMIT");
-    return res.json({ success: true, refundId });
+    return res.json({ success: true, refundId, restocked: !!restock });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ /refund-sale error:", err && (err.message || err));
