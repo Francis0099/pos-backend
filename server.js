@@ -161,47 +161,25 @@ app.get('/products', async (req, res) => {
 
 app.post('/submit-order', async (req, res) => {
   const { items, total, paymentMode } = req.body;
-
   if (!Array.isArray(items) || items.length === 0) {
     return res.json({ success: false, message: 'No items in order' });
   }
-
-  const normalizedPayment =
-    typeof paymentMode === "string" && paymentMode.length > 0 ? paymentMode : "CASH";
 
   const numericTotal = Number(total);
   if (!Number.isFinite(numericTotal) || numericTotal < 0) {
     return res.status(400).json({ success: false, message: "Invalid total amount" });
   }
 
-  const client = await pool.connect(); // ✅ Postgres transaction client
+  const client = await pool.connect();
   try {
     await client.query("BEGIN");
-
-    // Insert into sales
     const saleResult = await client.query(
       "INSERT INTO sales (total_amount, payment_mode) VALUES ($1, $2) RETURNING id",
-      [numericTotal, normalizedPayment]
+      [numericTotal, (paymentMode || 'CASH')]
     );
     const saleId = saleResult.rows[0].id;
 
-    // Insert sale items
-    const orderItems = items.map(it => [
-      saleId,
-      Number(it.id),
-      Number(it.quantity),
-    ]);
-
-    if (
-      orderItems.some(
-        r => !Number.isInteger(r[1]) || !Number.isInteger(r[2]) || r[2] <= 0
-      )
-    ) {
-      await client.query("ROLLBACK");
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid item ids or quantities" });
-    }
+    const orderItems = items.map(it => [saleId, Number(it.id), Number(it.quantity)]);
 
     for (const [sale_id, product_id, quantity] of orderItems) {
       await client.query(
@@ -209,9 +187,9 @@ app.post('/submit-order', async (req, res) => {
         [sale_id, product_id, quantity]
       );
 
-      // Fetch ingredients for each product
+      // fetch product ingredients including amount_unit and ingredient piece sizing
       const ingredientsResult = await client.query(
-        `SELECT pi.ingredient_id, pi.amount_needed, i.name, i.unit, i.stock
+        `SELECT pi.ingredient_id, pi.amount_needed, pi.amount_unit, i.unit AS ingredient_unit, i.piece_amount, i.piece_unit
          FROM product_ingredients pi
          JOIN ingredients i ON pi.ingredient_id = i.id
          WHERE pi.product_id = $1`,
@@ -219,18 +197,24 @@ app.post('/submit-order', async (req, res) => {
       );
 
       for (const ing of ingredientsResult.rows) {
-        const totalNeeded = Number(ing.amount_needed) * quantity;
+        const prodAmount = Number(ing.amount_needed);
+        const prodUnit = ing.amount_unit || ing.ingredient_unit;
+        const invUnit = ing.ingredient_unit;
 
-        // Deduct from stock
+        const perItemInventory = convertToInventoryUnits(prodAmount, prodUnit, invUnit, {
+          piece_amount: ing.piece_amount,
+          piece_unit: ing.piece_unit,
+        });
+
+        const totalNeeded = Number.isFinite(perItemInventory) ? perItemInventory * quantity : prodAmount * quantity;
+
         await client.query(
           "UPDATE ingredients SET stock = GREATEST(stock - $1, 0) WHERE id = $2",
           [totalNeeded, ing.ingredient_id]
         );
 
-        // Track usage
         await client.query(
-          `INSERT INTO ingredient_usage 
-             (sale_id, product_id, ingredient_id, amount_used, created_at)
+          `INSERT INTO ingredient_usage (sale_id, product_id, ingredient_id, amount_used, created_at)
            VALUES ($1, $2, $3, $4, NOW())`,
           [saleId, product_id, ing.ingredient_id, totalNeeded]
         );
@@ -238,23 +222,80 @@ app.post('/submit-order', async (req, res) => {
     }
 
     await client.query("COMMIT");
-    return res.json({
-      success: true,
-      message: "✅ Order successfully recorded",
-      saleId,
-    });
+    return res.json({ success: true, message: "Order recorded", saleId });
   } catch (err) {
-    console.error("❌ submit-order error:", err.message);
     await client.query("ROLLBACK");
-    return res.status(500).json({
-      success: false,
-      message: "Order failed",
-      error: err.message,
-    });
+    console.error("❌ submit-order error:", err && (err.message || err));
+    return res.status(500).json({ success: false, message: "Order failed", error: String(err && err.message || err) });
   } finally {
-    client.release(); // ✅ Release connection back to pool
+    client.release();
   }
 });
+
+
+// ---------------------- small unit conversion helpers (insert after dbQuery) ----------------------
+function normUnit(u) {
+  if (!u) return "";
+  const s = String(u).toLowerCase().trim();
+  if (["g", "gram", "grams"].includes(s)) return "g";
+  if (["kg", "kilogram", "kilograms"].includes(s)) return "kg";
+  if (["ml", "milliliter", "milliliters"].includes(s)) return "ml";
+  if (["l", "liter", "liters"].includes(s)) return "l";
+  if (["piece", "pieces", "pc", "pcs"].includes(s)) return "piece";
+  if (["unit", "units"].includes(s)) return "unit";
+  return s;
+}
+
+function convertSimple(value, fromUnit, toUnit) {
+  const f = normUnit(fromUnit);
+  const t = normUnit(toUnit);
+  if (!f || !t) return NaN;
+  if (f === t) return Number(value);
+
+  // mass
+  if (f === "g" && t === "kg") return Number(value) / 1000;
+  if (f === "kg" && t === "g") return Number(value) * 1000;
+  // volume
+  if (f === "ml" && t === "l") return Number(value) / 1000;
+  if (f === "l" && t === "ml") return Number(value) * 1000;
+
+  return NaN;
+}
+
+/**
+ * Convert product amount (productUnit) into ingredient inventory unit (inventoryUnit).
+ * ingredientRow may contain piece_amount and piece_unit when conversion involves pieces.
+ * Returns numeric converted amount or NaN when conversion not possible.
+ */
+function convertToInventoryUnits(amount, productUnit, inventoryUnit, ingredientRow = {}) {
+  const prodU = normUnit(productUnit || inventoryUnit);
+  const invU = normUnit(inventoryUnit);
+
+  const direct = convertSimple(amount, prodU, invU);
+  if (!Number.isNaN(direct)) return direct;
+
+  const pieceAmount = ingredientRow.piece_amount != null ? Number(ingredientRow.piece_amount) : null;
+  const pieceUnit = ingredientRow.piece_unit || null;
+
+  // inventory stored as pieces, product unit is volume/mass -> how many pieces needed?
+  if (invU === "piece" && pieceAmount && pieceUnit) {
+    const perPieceInProd = convertSimple(pieceAmount, pieceUnit, prodU);
+    if (!Number.isNaN(perPieceInProd) && perPieceInProd > 0) {
+      return Number(amount) / perPieceInProd;
+    }
+  }
+
+  // product unit is piece and inventory is mass/volume -> pieces * per-piece amount (converted)
+  if (prodU === "piece" && pieceAmount && pieceUnit) {
+    const perPieceInInv = convertSimple(pieceAmount, pieceUnit, invU);
+    if (!Number.isNaN(perPieceInInv)) {
+      return Number(amount) * perPieceInInv;
+    }
+  }
+
+  return NaN;
+}
+// ---------------------- end helpers ----------------------
 
 
 
@@ -1377,11 +1418,24 @@ app.post("/refund-sale", async (req, res) => {
       // restore ingredient stock only when restock is truthy
       if (restock) {
         const ingrRes = await client.query(
-          "SELECT ingredient_id, amount_needed FROM product_ingredients WHERE product_id = $1",
+          `SELECT pi.ingredient_id, pi.amount_needed, pi.amount_unit, i.unit AS ingredient_unit, i.piece_amount, i.piece_unit
+           FROM product_ingredients pi
+           JOIN ingredients i ON pi.ingredient_id = i.id
+           WHERE pi.product_id = $1`,
           [it.productId]
         );
+
         for (const row of ingrRes.rows) {
-          const restore = Number(row.amount_needed) * it.quantity;
+          const prodAmount = Number(row.amount_needed);
+          const prodUnit = row.amount_unit || row.ingredient_unit;
+          const invUnit = row.ingredient_unit;
+
+          const perItemInventory = convertToInventoryUnits(prodAmount, prodUnit, invUnit, {
+            piece_amount: row.piece_amount,
+            piece_unit: row.piece_unit,
+          });
+
+          const restore = Number.isFinite(perItemInventory) ? perItemInventory * it.quantity : prodAmount * it.quantity;
           if (restore > 0) {
             await client.query(
               "UPDATE ingredients SET stock = stock + $1 WHERE id = $2",
@@ -1397,7 +1451,7 @@ app.post("/refund-sale", async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ /refund-sale error:", err && (err.message || err));
-    return res.status(500).json({ success: false, message: "Refund failed", error: String(err.message || err) });
+    return res.status(500).json({ success: false, message: "Refund failed", error: String(err && err.message || err) });
   } finally {
     client.release();
   }
