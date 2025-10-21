@@ -263,41 +263,54 @@ function convertSimple(value, fromUnit, toUnit) {
 }
 
 /**
- * Convert product amount (productUnit) into ingredient inventory unit (inventoryUnit).
- * ingredientRow may contain piece_amount and piece_unit when conversion involves pieces.
- * Returns numeric converted amount or NaN when conversion not possible.
+ * Determine if a product-level unit can be converted to the ingredient inventory unit.
+ * Rules:
+ * - mass <-> mass allowed (g, kg)
+ * - volume <-> volume allowed (ml, l)
+ * - piece <-> piece allowed
+ * - piece <-> mass/volume allowed ONLY if ingredient has piece_amount + piece_unit and those units are convertible to the other side
+ * - unit (generic) is non-convertible except when identical
  */
-function convertToInventoryUnits(amount, productUnit, inventoryUnit, ingredientRow = {}) {
-  const prodU = normUnit(productUnit || inventoryUnit);
-  const invU = normUnit(inventoryUnit);
+function canConvert(productUnit, inventoryUnit, ingredientRow = {}) {
+  const p = normUnit(productUnit || inventoryUnit);
+  const i = normUnit(inventoryUnit);
 
-  const direct = convertSimple(amount, prodU, invU);
-  if (!Number.isNaN(direct)) return direct;
+  if (!p || !i) return false;
+  if (p === i) return true;
 
-  const pieceAmount = ingredientRow.piece_amount != null ? Number(ingredientRow.piece_amount) : null;
-  const pieceUnit = ingredientRow.piece_unit || null;
+  const massSet = new Set(["g", "kg"]);
+  const volumeSet = new Set(["ml", "l"]);
 
-  // inventory stored as pieces, product unit is volume/mass -> how many pieces needed?
-  if (invU === "piece" && pieceAmount && pieceUnit) {
-    const perPieceInProd = convertSimple(pieceAmount, pieceUnit, prodU);
-    if (!Number.isNaN(perPieceInProd) && perPieceInProd > 0) {
-      return Number(amount) / perPieceInProd;
+  // mass <-> mass allowed
+  if (massSet.has(p) && massSet.has(i)) return true;
+  // volume <-> volume allowed
+  if (volumeSet.has(p) && volumeSet.has(i)) return true;
+  // piece <-> piece allowed
+  if (p === "piece" && i === "piece") return true;
+
+  // piece <-> mass/volume only if ingredient defines piece_amount + piece_unit and that piece_unit can convert to the other unit
+  if ((p === "piece" && (massSet.has(i) || volumeSet.has(i))) || (i === "piece" && (massSet.has(p) || volumeSet.has(p)))) {
+    const pieceAmount = ingredientRow?.piece_amount != null ? Number(ingredientRow.piece_amount) : null;
+    const pieceUnit = ingredientRow?.piece_unit || null;
+    if (!pieceAmount || !pieceUnit) return false;
+
+    // if inventory is piece and product is mass/volume: check piece_unit -> productUnit convertible (piece_unit -> p)
+    if (i === "piece" && (massSet.has(p) || volumeSet.has(p))) {
+      const conv = convertSimple(pieceAmount, pieceUnit, p);
+      return !Number.isNaN(conv) && conv > 0;
+    }
+    // if product is piece and inventory is mass/volume: check piece_unit -> inventoryUnit convertible (piece_unit -> i)
+    if (p === "piece" && (massSet.has(i) || volumeSet.has(i))) {
+      const conv = convertSimple(pieceAmount, pieceUnit, i);
+      return !Number.isNaN(conv) && conv > 0;
     }
   }
 
-  // product unit is piece and inventory is mass/volume -> pieces * per-piece amount (converted)
-  if (prodU === "piece" && pieceAmount && pieceUnit) {
-    const perPieceInInv = convertSimple(pieceAmount, pieceUnit, invU);
-    if (!Number.isNaN(perPieceInInv)) {
-      return Number(amount) * perPieceInInv;
-    }
-  }
-
-  return NaN;
+  // all other cross-dimension conversions disallowed
+  return false;
 }
-// ---------------------- end helpers ----------------------
 
-
+// ...existing code...
 
 app.post("/add-product", async (req, res) => {
   const { name, category, price, sku, photo, color, ingredients } = req.body;
@@ -342,6 +355,31 @@ app.post("/add-product", async (req, res) => {
       return res
         .status(409)
         .json({ success: false, message: "Product name already exists" });
+    }
+
+    // Validate units for provided ingredients BEFORE insert
+    if (Array.isArray(ingredients) && ingredients.length > 0) {
+      for (const ing of ingredients) {
+        // fetch ingredient definition
+        const ingRowRes = await client.query(
+          "SELECT id, unit, piece_amount, piece_unit FROM ingredients WHERE id = $1 LIMIT 1",
+          [ing.id]
+        );
+        if (ingRowRes.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, message: `Ingredient id ${ing.id} not found` });
+        }
+        const ingRow = ingRowRes.rows[0];
+        const prodUnit = ing.unit ?? ingRow.unit;
+        const invUnit = ingRow.unit;
+        if (!canConvert(prodUnit, invUnit, { piece_amount: ingRow.piece_amount, piece_unit: ingRow.piece_unit })) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            success: false,
+            message: `Incompatible unit for ingredient '${ingRow.name || ing.id}': product unit '${prodUnit}' cannot convert to inventory unit '${invUnit}'`
+          });
+        }
+      }
     }
 
     // Insert product
@@ -535,6 +573,34 @@ app.put("/products/:id/ingredients", async (req, res) => {
   try {
     await client.query("BEGIN");
 
+    // Validate all ingredient units against ingredient definitions
+    if (ingredients.length > 0) {
+      const ids = ingredients.map((x) => Number(x.ingredientId));
+      const ingrRes = await client.query(
+        `SELECT id, name, unit, piece_amount, piece_unit FROM ingredients WHERE id = ANY($1)`,
+        [ids]
+      );
+      const byId = {};
+      for (const r of ingrRes.rows) byId[r.id] = r;
+
+      for (const ing of ingredients) {
+        const row = byId[Number(ing.ingredientId)];
+        if (!row) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, message: `Ingredient id ${ing.ingredientId} not found` });
+        }
+        const prodUnit = ing.unit ?? row.unit;
+        const invUnit = row.unit;
+        if (!canConvert(prodUnit, invUnit, { piece_amount: row.piece_amount, piece_unit: row.piece_unit })) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            success: false,
+            message: `Incompatible unit for ingredient '${row.name}': product unit '${prodUnit}' cannot convert to inventory unit '${invUnit}'`
+          });
+        }
+      }
+    }
+
     // Delete old ingredients for this product
     await client.query("DELETE FROM product_ingredients WHERE product_id = $1", [
       id,
@@ -572,7 +638,6 @@ app.put("/products/:id/ingredients", async (req, res) => {
     client.release();
   }
 });
-
 
 // CREATE Ingredient
 app.post("/ingredients", async (req, res) => {
