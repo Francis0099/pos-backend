@@ -48,31 +48,79 @@ async function dbQuery(text, params = []) {
 
 // Example: replace your existing products endpoints with versions that use dbQuery
 app.get("/products-with-stock", async (req, res) => {
-  const sql = `
-    SELECT p.id, p.name, p.category, 
-           ROUND(CAST(p.price AS NUMERIC), 2) AS price,
-           MIN(FLOOR(i.stock / pi.amount_needed)) AS stock
-    FROM products p
-    LEFT JOIN product_ingredients pi ON p.id = pi.product_id
-    LEFT JOIN ingredients i ON pi.ingredient_id = i.id
-    WHERE p.is_active = TRUE
-    GROUP BY p.id
-  `;
-
   try {
-    const { rows } = await pool.query(sql);
+    // fetch all active products (basic fields)
+    const prodRes = await pool.query(
+      `SELECT id, name, price, category, sku, photo, color, is_active
+       FROM products
+       WHERE (is_active = true OR is_active IS NULL)`
+    );
+    const products = prodRes.rows || [];
+    const out = [];
 
-    const products = rows.map((row) => ({
-      ...row,
-      price: row.price !== null ? Number(row.price) : 0,
-      stock: row.stock !== null ? Number(row.stock) : 0,
-    }));
+    for (const p of products) {
+      // load product ingredients + ingredient inventory info
+      const ingrRes = await pool.query(
+        `SELECT
+           pi.ingredient_id,
+           pi.amount_needed,
+           pi.amount_unit,
+           i.unit AS ingredient_unit,
+           i.stock AS ingredient_stock,
+           i.piece_amount,
+           i.piece_unit
+         FROM product_ingredients pi
+         JOIN ingredients i ON pi.ingredient_id = i.id
+         WHERE pi.product_id = $1`,
+        [p.id]
+      );
 
-    res.json(products);
+      const counts = [];
+
+      for (const r of ingrRes.rows) {
+        const prodAmount = Number(r.amount_needed);
+        if (!Number.isFinite(prodAmount) || prodAmount <= 0) {
+          counts.push(0);
+          continue;
+        }
+
+        const prodUnit = r.amount_unit || r.ingredient_unit;
+        const invAmt = Number(r.ingredient_stock ?? 0);
+        const invUnit = r.ingredient_unit;
+
+        const invInProdUnits = convertInventoryToProductUnits(invAmt, invUnit, prodUnit, {
+          piece_amount: r.piece_amount,
+          piece_unit: r.piece_unit,
+        });
+
+        if (!Number.isFinite(invInProdUnits)) {
+          // cannot convert -> treat as blocker (0 available)
+          counts.push(0);
+        } else {
+          const availableCount = Math.floor(invInProdUnits / prodAmount);
+          counts.push(Number.isFinite(availableCount) ? Math.max(0, availableCount) : 0);
+        }
+      }
+
+      const available = counts.length > 0 ? Math.min(...counts) : 0;
+
+      out.push({
+        id: p.id,
+        name: p.name,
+        price: p.price !== null ? Number(p.price) : 0,
+        category: p.category,
+        sku: p.sku,
+        photo: p.photo,
+        color: p.color,
+        is_active: p.is_active,
+        stock: available,
+      });
+    }
+
+    return res.json(out);
   } catch (err) {
-    console.error("❌ Error fetching products with stock:", err.message || err);
-    // include details for dev debugging
-    res.status(500).json({ success: false, message: "Database error", details: String(err.message || err) });
+    console.error("❌ /products-with-stock error:", err && (err.message || err));
+    return res.status(500).json({ success: false, message: "Failed to compute product stock", error: String(err && err.message || err) });
   }
 });
 
@@ -343,7 +391,39 @@ function canConvert(productUnit, inventoryUnit, ingredientRow = {}) {
   return false;
 }
 
-// ...existing code...
+// ---------------------- add helper: inventory -> product units ----------------------
+function convertInventoryToProductUnits(inventoryAmount, inventoryUnit, productUnit, ingredientRow = {}) {
+  // try direct convert inventory -> product unit
+  const direct = convertSimple(inventoryAmount, inventoryUnit, productUnit);
+  if (!Number.isNaN(direct)) return direct;
+
+  const invU = normUnit(inventoryUnit);
+  const prodU = normUnit(productUnit);
+
+  const pieceAmount = ingredientRow && ingredientRow.piece_amount != null ? Number(ingredientRow.piece_amount) : null;
+  const pieceUnit = ingredientRow && ingredientRow.piece_unit ? String(ingredientRow.piece_unit) : null;
+
+  // inventory is pieces and product expects mass/volume: each piece -> pieceAmount (pieceUnit) -> convert pieceUnit -> productUnit
+  if (invU === "piece" && pieceAmount && pieceUnit) {
+    const perPieceInProd = convertSimple(pieceAmount, pieceUnit, productUnit);
+    if (!Number.isNaN(perPieceInProd)) {
+      return Number(inventoryAmount) * perPieceInProd;
+    }
+  }
+
+  // inventory is mass/volume and product expects pieces: number of pieces available = inventoryAmount / (perPiece in inventoryUnit)
+  if (prodU === "piece" && pieceAmount && pieceUnit) {
+    const perPieceInInv = convertSimple(pieceAmount, pieceUnit, inventoryUnit);
+    if (!Number.isNaN(perPieceInInv) && perPieceInInv > 0) {
+      return Number(inventoryAmount) / perPieceInInv;
+    }
+  }
+
+  // otherwise conversion not possible
+  return NaN;
+}
+// ---------------------- end helper ----------------------
+
 
 app.post("/add-product", async (req, res) => {
   const { name, category, price, sku, photo, color, ingredients } = req.body;
@@ -700,39 +780,6 @@ app.post("/ingredients", async (req, res) => {
   }
 });
 
-
-// ✅ Get all active products with computed stock
-app.get("/products-with-stock", async (req, res) => {
-  const sql = `
-    SELECT p.id, p.name, p.category, 
-           ROUND(CAST(p.price AS NUMERIC), 2) AS price,
-           MIN(FLOOR(i.stock / pi.amount_needed)) AS stock
-    FROM products p
-    LEFT JOIN product_ingredients pi ON p.id = pi.product_id
-    LEFT JOIN ingredients i ON pi.ingredient_id = i.id
-    WHERE p.is_active = TRUE
-    GROUP BY p.id
-  `;
-
-  try {
-    const { rows } = await pool.query(sql);
-
-    const products = rows.map((row) => ({
-      ...row,
-      price: row.price !== null ? Number(row.price) : 0,
-      stock: row.stock !== null ? Number(row.stock) : 0,
-    }));
-
-    res.json(products);
-  } catch (err) {
-    console.error("❌ Error fetching products with stock:", err.message || err);
-    // include details for dev debugging
-    res.status(500).json({ success: false, message: "Database error", details: String(err.message || err) });
-  }
-});
-
-
-
 // ✅ Toggle product active/inactive (with message)
 app.put("/products/:id/toggle", async (req, res) => {
   const { id } = req.params;
@@ -836,8 +883,6 @@ app.get('/products-all', async (req, res) => {
     res.status(500).json({ success: false, message: "Database error" });
   }
 });
-
-
 
 
 app.get('/categories', async (req, res) => {
