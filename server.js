@@ -312,13 +312,13 @@ app.post("/add-product", async (req, res) => {
     );
     const productId = productResult.rows[0].id;
 
-    // Insert ingredients if any
+    // Insert ingredients if any (store amount_unit if provided, else fallback to ingredient.unit via migration/backfill)
     if (ingredients && ingredients.length > 0) {
       for (const ing of ingredients) {
         await client.query(
-          `INSERT INTO product_ingredients (product_id, ingredient_id, amount_needed)
-           VALUES ($1, $2, $3)`,
-          [productId, ing.id, Number(ing.amount)]
+          `INSERT INTO product_ingredients (product_id, ingredient_id, amount_needed, amount_unit)
+           VALUES ($1, $2, $3, $4)`,
+          [productId, ing.id, Number(ing.amount), ing.unit ?? null]
         );
       }
     }
@@ -405,7 +405,6 @@ app.get("/products/:id", async (req, res) => {
   }
 });
 
-
 // ✅ Update product basic fields (name, category, price)
 app.put("/products/:id", async (req, res) => {
   const { id } = req.params;
@@ -438,13 +437,15 @@ app.put("/products/:id", async (req, res) => {
   }
 });
 
-
 // ✅ Get a product's ingredients and required amounts
 app.get("/products/:id/ingredients", async (req, res) => {
   const { id } = req.params;
 
   const sql = `
-    SELECT i.id, i.name, i.unit, pi.amount_needed AS amount
+    SELECT i.id,
+           i.name,
+           COALESCE(pi.amount_unit, i.unit) AS unit,
+           pi.amount_needed AS amount
     FROM product_ingredients pi
     JOIN ingredients i ON i.id = pi.ingredient_id
     WHERE pi.product_id = $1
@@ -468,11 +469,10 @@ app.get("/products/:id/ingredients", async (req, res) => {
   }
 });
 
-
 // ✅ Replace product ingredients and their amounts (idempotent set)
 app.put("/products/:id/ingredients", async (req, res) => {
   const { id } = req.params;
-  const { ingredients } = req.body; // [{ ingredientId, amount }]
+  const { ingredients } = req.body; // [{ ingredientId, amount, unit }]
 
   if (!Array.isArray(ingredients)) {
     return res
@@ -499,19 +499,19 @@ app.put("/products/:id/ingredients", async (req, res) => {
       id,
     ]);
 
-    // Insert new ingredients if provided
+    // Insert new ingredients if provided - include amount_unit (product-specific UOM)
     if (ingredients.length > 0) {
-      const values = [];
       const params = [];
-
+      const values = [];
       ingredients.forEach((ing, idx) => {
-        const base = idx * 3;
-        params.push(`($${base + 1}, $${base + 2}, $${base + 3})`);
-        values.push(id, ing.ingredientId, Number(ing.amount));
+        const base = idx * 4;
+        params.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`);
+        // product_id, ingredient_id, amount_needed, amount_unit
+        values.push(id, ing.ingredientId, Number(ing.amount), ing.unit ?? null);
       });
 
       const sql = `
-        INSERT INTO product_ingredients (product_id, ingredient_id, amount_needed)
+        INSERT INTO product_ingredients (product_id, ingredient_id, amount_needed, amount_unit)
         VALUES ${params.join(",")}
       `;
 
@@ -531,7 +531,6 @@ app.put("/products/:id/ingredients", async (req, res) => {
     client.release();
   }
 });
-
 
 
 // CREATE Ingredient
@@ -563,7 +562,6 @@ app.post("/ingredients", async (req, res) => {
     res.status(500).json({ success: false, message: "Database error" });
   }
 });
-
 
 
 // ✅ Get all active products with computed stock
@@ -716,7 +714,6 @@ app.get('/categories', async (req, res) => {
     res.status(500).json({ success: false, message: 'Database error' });
   }
 });
-
 
 // ✅ Create category
 app.post('/categories', async (req, res) => {
@@ -1197,7 +1194,6 @@ app.get('/best-sellers', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Failed to fetch best sellers' });
   }
 });
-
 
 
 app.get('/dashboard-summary', async (req, res) => {
