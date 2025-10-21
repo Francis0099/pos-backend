@@ -232,7 +232,6 @@ app.post('/submit-order', async (req, res) => {
   }
 });
 
-
 // ---------------------- small unit conversion helpers (insert after dbQuery) ----------------------
 function normUnit(u) {
   if (!u) return "";
@@ -259,6 +258,40 @@ function convertSimple(value, fromUnit, toUnit) {
   if (f === "ml" && t === "l") return Number(value) / 1000;
   if (f === "l" && t === "ml") return Number(value) * 1000;
 
+  return NaN;
+}
+
+/**
+ * Convert amount expressed in productUnit to inventoryUnit using ingredientRow (supports piece sizing).
+ * Returns converted numeric or NaN if conversion not possible.
+ */
+function convertToInventoryUnits(amount, productUnit, inventoryUnit, ingredientRow = {}) {
+  const prodU = normUnit(productUnit || inventoryUnit);
+  const invU = normUnit(inventoryUnit);
+  // direct/simple conversion (mass <-> mass, volume <-> volume)
+  const direct = convertSimple(amount, prodU, invU);
+  if (!Number.isNaN(direct)) return direct;
+
+  const pieceAmount = ingredientRow && ingredientRow.piece_amount != null ? Number(ingredientRow.piece_amount) : null;
+  const pieceUnit = ingredientRow && ingredientRow.piece_unit ? String(ingredientRow.piece_unit) : null;
+
+  // inventory stored as pieces, product unit is mass/volume -> how many pieces needed?
+  if (invU === "piece" && pieceAmount && pieceUnit) {
+    const perPieceInProd = convertSimple(pieceAmount, pieceUnit, prodU);
+    if (!Number.isNaN(perPieceInProd) && perPieceInProd > 0) {
+      return Number(amount) / perPieceInProd;
+    }
+  }
+
+  // product unit is piece and inventory is mass/volume -> pieces * per-piece amount (converted)
+  if (prodU === "piece" && pieceAmount && pieceUnit) {
+    const perPieceInInv = convertSimple(pieceAmount, pieceUnit, invU);
+    if (!Number.isNaN(perPieceInInv)) {
+      return Number(amount) * perPieceInInv;
+    }
+  }
+
+  // conversion not possible
   return NaN;
 }
 
@@ -426,7 +459,6 @@ app.post("/add-product", async (req, res) => {
 });
 
 
-
 app.delete("/products/:id", async (req, res) => {
   const { id } = req.params;
 
@@ -453,7 +485,6 @@ app.delete("/products/:id", async (req, res) => {
       .json({ success: false, message: "Database error", error: err.message });
   }
 });
-
 
 
 app.get("/products/:id", async (req, res) => {
