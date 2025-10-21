@@ -209,7 +209,7 @@ app.post('/submit-order', async (req, res) => {
         const totalNeeded = Number.isFinite(perItemInventory) ? perItemInventory * quantity : prodAmount * quantity;
 
         await client.query(
-          "UPDATE ingredients SET stock = GREATEST(stock - $1, 0) WHERE id = $2",
+          "UPDATE ingredients SET stock = GREATEST(stock - $1::numeric, 0::numeric) WHERE id = $2",
           [totalNeeded, ing.ingredient_id]
         );
 
@@ -1534,7 +1534,7 @@ app.post("/refund-sale", async (req, res) => {
           const restore = Number.isFinite(perItemInventory) ? perItemInventory * it.quantity : prodAmount * it.quantity;
           if (restore > 0) {
             await client.query(
-              "UPDATE ingredients SET stock = stock + $1 WHERE id = $2",
+              "UPDATE ingredients SET stock = stock + $1::numeric WHERE id = $2",
               [restore, row.ingredient_id]
             );
           }
