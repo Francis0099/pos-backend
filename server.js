@@ -1667,13 +1667,15 @@ app.get("/sales-summary", async (req, res) => {
     }
 
     // Parse end date to compute latest month/week within the selected range
-    const parsedEnd = try {
-      new Date(rawEnd || new Date().toISOString());
+    let endDate;
+    try {
+      endDate = rawEnd ? new Date(rawEnd) : new Date();
+      if (isNaN(endDate.getTime())) {
+        endDate = new Date();
+      }
     } catch (err) {
-      new Date();
-    } finally {}
-
-    const endDate = rawEnd ? new Date(rawEnd) : new Date();
+      endDate = new Date();
+    }
     // compute latest month/year from endDate (Manila local equivalent)
     const utcMs = endDate.getTime() + endDate.getTimezoneOffset() * 60000;
     const manilaMs = utcMs + 8 * 3600000;
