@@ -23,6 +23,19 @@ const pool = new Pool({
   },
 });
 
+// DEBUG: log all SQL queries and params so we can see the exact failing statement
+// Move this wrapper right after pool creation so any startup queries are logged
+const _realQuery = pool.query.bind(pool);
+pool.query = async (text, params = []) => {
+  try {
+    console.warn('[SQL QUERY]', typeof text === 'string' ? text.trim().replace(/\s+/g, ' ') : text, params);
+    return await _realQuery(text, params);
+  } catch (err) {
+    console.error('[SQL ERROR]', err.message, { text, params });
+    throw err;
+  }
+};
+
 // quick connection check - prints clear success or error to server console
 (async () => {
   try {
@@ -1678,8 +1691,19 @@ console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
 
 (async () => {
   try {
-    const r = await pool.query("SELECT current_database() AS db, current_user() AS user, inet_server_addr() AS host, inet_server_port() AS port");
-    console.warn('[startup] connected db=', r.rows[0]);
+    // safe minimal check first
+    const r = await pool.query("SELECT current_database() AS db, current_user() AS user");
+    const info = r.rows[0] || {};
+    // attempt inet_server_* in a separate try/catch (some PG setups disallow or don't support these)
+    try {
+      const hostRes = await pool.query("SELECT inet_server_addr() AS host, inet_server_port() AS port");
+      info.host = hostRes.rows[0]?.host || null;
+      info.port = hostRes.rows[0]?.port || null;
+    } catch (e) {
+      info.host = null;
+      info.port = null;
+    }
+    console.warn('[startup] connected db=', info);
   } catch (e) {
     console.warn('[startup] db check failed', e.message || e);
   }
@@ -1688,31 +1712,30 @@ console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
 // debug endpoint to inspect which DB the running server sees
 app.get('/debug-sales-columns', async (req, res) => {
   try {
-    const info = await pool.query("SELECT current_database() AS db, current_user() AS user, inet_server_addr() AS host, inet_server_port() AS port");
+    // minimal info first
+    const infoRes = await pool.query("SELECT current_database() AS db, current_user() AS user");
+    const info = { database: infoRes.rows[0]?.db || null, user: infoRes.rows[0]?.user || null };
+
+    // try inet_server_* but do not fail if unavailable
+    try {
+      const hostRes = await pool.query("SELECT inet_server_addr() AS host, inet_server_port() AS port");
+      info.host = hostRes.rows[0]?.host || null;
+      info.port = hostRes.rows[0]?.port || null;
+    } catch (e) {
+      info.host = null;
+      info.port = null;
+    }
+
     const cols = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'sales' ORDER BY column_name");
     res.json({
-      database: info.rows[0]?.db || null,
-      user: info.rows[0]?.user || null,
-      host: info.rows[0]?.host || null,
-      port: info.rows[0]?.port || null,
+      ...info,
       sales_columns: cols.rows.map(r => r.column_name)
     });
   } catch (err) {
+    console.error('/debug-sales-columns error:', err && err.message);
     res.status(500).json({ error: String(err?.message || err) });
   }
 });
-
-// DEBUG: log all SQL queries and params so we can see the exact failing statement
-const _realQuery = pool.query.bind(pool);
-pool.query = async (text, params = []) => {
-  try {
-    console.warn('[SQL QUERY]', typeof text === 'string' ? text.trim().replace(/\s+/g, ' ') : text, params);
-    return await _realQuery(text, params);
-  } catch (err) {
-    console.error('[SQL ERROR]', err.message, { text, params });
-    throw err;
-  }
-};
 
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
