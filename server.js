@@ -240,12 +240,43 @@ app.post('/submit-order', async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Insert sale record (store total inclusive of VAT)
-    const saleRes = await client.query(
-      `INSERT INTO sales (total_amount, subtotal_amount, tax_amount, payment_mode, created_at)
-       VALUES ($1, $2, $3, $4, NOW()) RETURNING id`,
-      [total, subtotal, tax, (paymentMode || 'CASH')]
-    );
+    // Detect whether sales table has subtotal_amount / tax_amount columns.
+    // If present, include them in the INSERT, otherwise insert only total_amount + payment_mode.
+    let saleRes;
+    try {
+      const colsQ = await client.query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_name = 'sales'
+           AND column_name IN ('subtotal_amount', 'tax_amount')`
+      );
+      const colNames = (colsQ.rows || []).map(r => String(r.column_name).toLowerCase());
+      const hasSubtotal = colNames.includes('subtotal_amount');
+      const hasTax = colNames.includes('tax_amount');
+
+      if (hasSubtotal && hasTax) {
+        saleRes = await client.query(
+          `INSERT INTO sales (total_amount, subtotal_amount, tax_amount, payment_mode, created_at)
+           VALUES ($1, $2, $3, $4, NOW()) RETURNING id`,
+          [total, subtotal, tax, (paymentMode || 'CASH')]
+        );
+      } else {
+        // fallback to older schema: only store total and payment_mode
+        saleRes = await client.query(
+          `INSERT INTO sales (total_amount, payment_mode, created_at)
+           VALUES ($1, $2, NOW()) RETURNING id`,
+          [total, (paymentMode || 'CASH')]
+        );
+      }
+    } catch (err) {
+      // if information_schema query fails for any reason, try the simple insert as a safe fallback
+      console.warn('sales column detection failed, falling back to simple insert', err && err.message);
+      saleRes = await client.query(
+        `INSERT INTO sales (total_amount, payment_mode, created_at)
+         VALUES ($1, $2, NOW()) RETURNING id`,
+        [total, (paymentMode || 'CASH')]
+      );
+    }
     const saleId = saleRes.rows[0].id;
 
     // Insert sale_items
@@ -286,9 +317,6 @@ app.post('/submit-order', async (req, res) => {
           `UPDATE ingredients SET stock = stock - $1 WHERE id = $2`,
           [converted, ing.ingredient_id]
         );
-
-        // Optional: insert inventory_deductions record if your schema records deductions
-        // await client.query(`INSERT INTO inventory_deductions (...) VALUES (...)`, [...]);
       }
     }
 
@@ -1272,7 +1300,7 @@ app.get("/sales-report", async (req, res) => {
         SUM(si.quantity)::int AS total_sold
       FROM sale_items si
       JOIN products p ON si.product_id = p.id
-      JOIN sales s ON si.sale_id = s.id
+      JOIN sales s ON s.id = si.sale_id
       ${whereTime}
       GROUP BY p.category, p.id, p.name
       ORDER BY category ASC, total_sold DESC
