@@ -1272,7 +1272,7 @@ app.get("/sales-report", async (req, res) => {
         SUM(si.quantity)::int AS total_sold
       FROM sale_items si
       JOIN products p ON si.product_id = p.id
-      JOIN sales s ON si.sale_id = s.id
+      JOIN sales s ON s.id = si.sale_id
       ${whereTime}
       GROUP BY p.category, p.id, p.name
       ORDER BY category ASC, total_sold DESC
@@ -1629,6 +1629,144 @@ app.get('/test-db', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).send('Database error');
+  }
+});
+
+// New: return totals for a given date range (start,end in Asia/Manila local date/time string or ISO)
+app.get("/sales-summary", async (req, res) => {
+  try {
+    const rawStart = String(req.query.start || "");
+    const rawEnd = String(req.query.end || "");
+
+    // default to today in Asia/Manila if not provided
+    const now = new Date();
+    // convert to Manila-local YYYY-MM-DD HH:MM:SS (we compare using timezone('Asia/Manila', created_at))
+    const pad = (n) => String(n).padStart(2, "0");
+
+    function toManilaDateStr(d) {
+      // build a local string (no timezone) representing Manila local instant
+      const utcMs = d.getTime() + d.getTimezoneOffset() * 60000;
+      const manilaMs = utcMs + 8 * 3600000;
+      const md = new Date(manilaMs);
+      return `${md.getFullYear()}-${pad(md.getMonth() + 1)}-${pad(md.getDate())} ${pad(md.getHours())}:${pad(md.getMinutes())}:${pad(md.getSeconds())}`;
+    }
+
+    let startStr = rawStart;
+    let endStr = rawEnd;
+
+    if (!startStr || !endStr) {
+      // default: start = start of today Manila, end = end of today Manila
+      const today = new Date();
+      // produce Manila midnight and Manila end-of-day
+      const utcMs = today.getTime() + today.getTimezoneOffset() * 60000;
+      const manilaNow = new Date(utcMs + 8 * 3600000);
+      const s = new Date(manilaNow); s.setHours(0, 0, 0, 0);
+      const e = new Date(manilaNow); e.setHours(23, 59, 59, 999);
+      startStr = toManilaDateStr(s);
+      endStr = toManilaDateStr(e);
+    }
+
+    // Parse end date to compute latest month/week within the selected range
+    const parsedEnd = try {
+      new Date(rawEnd || new Date().toISOString());
+    } catch (err) {
+      new Date();
+    } finally {}
+
+    const endDate = rawEnd ? new Date(rawEnd) : new Date();
+    // compute latest month/year from endDate (Manila local equivalent)
+    const utcMs = endDate.getTime() + endDate.getTimezoneOffset() * 60000;
+    const manilaMs = utcMs + 8 * 3600000;
+    const manilaEnd = new Date(manilaMs);
+    const latestMonth = manilaEnd.getMonth() + 1; // 1..12
+    const latestYear = manilaEnd.getFullYear();
+
+    // compute week (Monday..Sunday) that contains manilaEnd
+    const monday = new Date(manilaEnd);
+    const day = monday.getDay(); // 0..6 (Sun..Sat)
+    const diff = (day + 6) % 7;
+    monday.setDate(monday.getDate() - diff);
+    monday.setHours(0, 0, 0, 0);
+    const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+    sunday.setHours(23, 59, 59, 999);
+    const mondayStr = toManilaDateStr(monday);
+    const sundayStr = toManilaDateStr(sunday);
+
+    // total in range
+    const totalSql = `
+      SELECT COALESCE(SUM(total_amount),0)::numeric AS total
+      FROM sales
+      WHERE timezone('Asia/Manila', created_at) >= $1::timestamp
+        AND timezone('Asia/Manila', created_at) <= $2::timestamp
+    `;
+    const totalRes = await pool.query(totalSql, [startStr, endStr]);
+    const total = Number(totalRes.rows[0]?.total ?? 0);
+
+    // this month (latest month inside range)
+    const monthSql = `
+      SELECT COALESCE(SUM(total_amount),0)::numeric AS month_total
+      FROM sales
+      WHERE EXTRACT(MONTH FROM timezone('Asia/Manila', created_at)) = $1
+        AND EXTRACT(YEAR FROM timezone('Asia/Manila', created_at)) = $2
+        AND timezone('Asia/Manila', created_at) >= $3::timestamp
+        AND timezone('Asia/Manila', created_at) <= $4::timestamp
+    `;
+    const monthRes = await pool.query(monthSql, [latestMonth, latestYear, startStr, endStr]);
+    const monthTotal = Number(monthRes.rows[0]?.month_total ?? 0);
+
+    // this week (Monday..Sunday containing end) but constrained by the overall range
+    const weekSql = `
+      SELECT COALESCE(SUM(total_amount),0)::numeric AS week_total
+      FROM sales
+      WHERE timezone('Asia/Manila', created_at) >= $1::timestamp
+        AND timezone('Asia/Manila', created_at) <= $2::timestamp
+        AND timezone('Asia/Manila', created_at) >= $3::timestamp
+        AND timezone('Asia/Manila', created_at) <= $4::timestamp
+    `;
+    // parameters: mondayStr, sundayStr, startStr, endStr -> effective overlapping period between week and overall range
+    const weekRes = await pool.query(weekSql, [mondayStr, sundayStr, startStr, endStr]);
+    const weekTotal = Number(weekRes.rows[0]?.week_total ?? 0);
+
+    // payment breakdown (grouped by payment_mode)
+    const breakdownSql = `
+      SELECT COALESCE(payment_mode,'Unknown') AS payment_mode, COALESCE(SUM(total_amount),0)::numeric AS amount
+      FROM sales
+      WHERE timezone('Asia/Manila', created_at) >= $1::timestamp
+        AND timezone('Asia/Manila', created_at) <= $2::timestamp
+      GROUP BY payment_mode
+    `;
+    const br = await pool.query(breakdownSql, [startStr, endStr]);
+    const breakdown = { Cash: 0, Card: 0, Split: 0 };
+    for (const row of br.rows) {
+      const key = String(row.payment_mode || "").toLowerCase();
+      const amt = Number(row.amount || 0);
+      if (key.includes("cash")) breakdown.Cash += amt;
+      else if (key.includes("card")) breakdown.Card += amt;
+      else if (key.includes("split")) breakdown.Split += amt;
+      else {
+        // fallback: map "CASH","CARD","SPLIT" or others
+        if (String(row.payment_mode).toUpperCase() === "CASH") breakdown.Cash += amt;
+        else if (String(row.payment_mode).toUpperCase() === "CARD") breakdown.Card += amt;
+        else if (String(row.payment_mode).toUpperCase() === "SPLIT") breakdown.Split += amt;
+        else {
+          // accumulate to Cash as default
+          breakdown.Cash += amt;
+        }
+      }
+    }
+
+    return res.json({
+      success: true,
+      total,
+      monthTotal,
+      weekTotal,
+      breakdown,
+      start: startStr,
+      end: endStr,
+    });
+  } catch (err) {
+    console.error("❌ /sales-summary error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Failed to compute sales summary", error: String(err && err.message || err) });
   }
 });
 
