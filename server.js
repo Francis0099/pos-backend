@@ -241,7 +241,7 @@ app.post('/submit-order', async (req, res) => {
     await client.query('BEGIN');
 
     // Detect whether sales table has subtotal_amount / tax_amount columns.
-    // If present, include them in the INSERT, otherwise insert only total_amount + payment_mode.
+    // If present, try the full insert; if it fails due to missing column, fallback to simple insert.
     let saleRes;
     try {
       const colsQ = await client.query(
@@ -251,17 +251,30 @@ app.post('/submit-order', async (req, res) => {
            AND column_name IN ('subtotal_amount', 'tax_amount')`
       );
       const colNames = (colsQ.rows || []).map(r => String(r.column_name).toLowerCase());
+      console.log("submit-order: detected sales columns:", colNames);
+
       const hasSubtotal = colNames.includes('subtotal_amount');
       const hasTax = colNames.includes('tax_amount');
 
       if (hasSubtotal && hasTax) {
-        saleRes = await client.query(
-          `INSERT INTO sales (total_amount, subtotal_amount, tax_amount, payment_mode, created_at)
-           VALUES ($1, $2, $3, $4, NOW()) RETURNING id`,
-          [total, subtotal, tax, (paymentMode || 'CASH')]
-        );
+        try {
+          saleRes = await client.query(
+            `INSERT INTO sales (total_amount, subtotal_amount, tax_amount, payment_mode, created_at)
+             VALUES ($1, $2, $3, $4, NOW()) RETURNING id`,
+            [total, subtotal, tax, (paymentMode || 'CASH')]
+          );
+        } catch (errInsert) {
+          // If insert failed because columns really don't exist (or other DB mismatch), log and fallback
+          console.warn("submit-order: full insert failed, falling back to simple insert. error:", errInsert.message || errInsert);
+          saleRes = await client.query(
+            `INSERT INTO sales (total_amount, payment_mode, created_at)
+             VALUES ($1, $2, NOW()) RETURNING id`,
+            [total, (paymentMode || 'CASH')]
+          );
+        }
       } else {
         // fallback to older schema: only store total and payment_mode
+        console.log("submit-order: subtotal/tax columns not present, using simple insert");
         saleRes = await client.query(
           `INSERT INTO sales (total_amount, payment_mode, created_at)
            VALUES ($1, $2, NOW()) RETURNING id`,
@@ -270,7 +283,7 @@ app.post('/submit-order', async (req, res) => {
       }
     } catch (err) {
       // if information_schema query fails for any reason, try the simple insert as a safe fallback
-      console.warn('sales column detection failed, falling back to simple insert', err && err.message);
+      console.warn('submit-order: sales column detection failed, falling back to simple insert', err && err.message);
       saleRes = await client.query(
         `INSERT INTO sales (total_amount, payment_mode, created_at)
          VALUES ($1, $2, NOW()) RETURNING id`,
