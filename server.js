@@ -19,7 +19,7 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false, // Render requires SSL
+    rejectUnauthorized: false,  // Render requires SSL
   },
 });
 
@@ -1701,6 +1701,18 @@ app.get('/debug-sales-columns', async (req, res) => {
     res.status(500).json({ error: String(err?.message || err) });
   }
 });
+
+// DEBUG: log all SQL queries and params so we can see the exact failing statement
+const _realQuery = pool.query.bind(pool);
+pool.query = async (text, params = []) => {
+  try {
+    console.warn('[SQL QUERY]', typeof text === 'string' ? text.trim().replace(/\s+/g, ' ') : text, params);
+    return await _realQuery(text, params);
+  } catch (err) {
+    console.error('[SQL ERROR]', err.message, { text, params });
+    throw err;
+  }
+};
 
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
