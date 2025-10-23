@@ -1692,7 +1692,8 @@ console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
 (async () => {
   try {
     // ✅ Step 1: Safe minimal DB check
-    const r = await pool.query("SELECT current_database() AS db, current_user AS user");
+    const r = await pool.query("SELECT current_database() AS db, current_user AS usr");
+
     const info = r.rows[0] || {};
 
     // ✅ Step 2: Optional host/port info (some setups don’t support inet_server_*)
@@ -1712,16 +1713,13 @@ console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
   }
 })();
 
-
 // debug endpoint to inspect which DB the running server sees
 app.get('/debug-sales-columns', async (req, res) => {
   try {
     // ✅ Step 1: Basic DB info (always works)
-    const infoRes = await pool.query("SELECT current_database() AS db, current_user AS user");
-    const info = {
-      database: infoRes.rows[0]?.db || null,
-      user: infoRes.rows[0]?.user || null
-    };
+    const infoRes = await pool.query("SELECT current_database() AS db, current_user AS usr");
+    const info = { database: r.rows[0]?.db || null, user: r.rows[0]?.usr || null };
+
 
     // ✅ Step 2: Optional host info (try/catch — won’t crash on Render)
     try {
