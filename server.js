@@ -1676,82 +1676,8 @@ app.post("/refund-sale", async (req, res) => {
 });
 
 
-app.get('/test-db', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT NOW()');
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Database error');
-  }
-});
-
-// debug: print env + DB connection info at startup
-console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
-
-(async () => {
-  try {
-    // ✅ Step 1: Safe minimal DB check
-    const r = await pool.query("SELECT current_database() AS db, current_user AS usr");
-
-    const info = r.rows[0] || {};
-
-    // ✅ Step 2: Optional host/port info (some setups don’t support inet_server_*)
-    try {
-      const hostRes = await pool.query("SELECT inet_server_addr() AS host, inet_server_port() AS port");
-      info.host = hostRes.rows[0]?.host || null;
-      info.port = hostRes.rows[0]?.port || null;
-    } catch (e) {
-      console.warn("[startup] inet_server_* not supported:", e.message);
-      info.host = "N/A";
-      info.port = "N/A";
-    }
-
-    console.warn('[startup] connected db=', info);
-  } catch (e) {
-    console.warn('[startup] db check failed', e.message || e);
-  }
-})();
 
 // debug endpoint to inspect which DB the running server sees
-app.get('/debug-sales-columns', async (req, res) => {
-  try {
-    // ✅ Step 1: Basic DB info (always works)
-    const infoRes = await pool.query("SELECT current_database() AS db, current_user AS usr");
-    const info = { database: r.rows[0]?.db || null, user: r.rows[0]?.usr || null };
-
-
-    // ✅ Step 2: Optional host info (try/catch — won’t crash on Render)
-    try {
-      const hostRes = await pool.query("SELECT inet_server_addr() AS host, inet_server_port() AS port");
-      info.host = hostRes.rows[0]?.host || null;
-      info.port = hostRes.rows[0]?.port || null;
-    } catch (e) {
-      console.warn("[debug-sales-columns] inet_server_* not supported:", e.message);
-      info.host = "N/A";
-      info.port = "N/A";
-    }
-
-    // ✅ Step 3: Get all sales table columns
-    const cols = await pool.query(`
-      SELECT column_name
-      FROM information_schema.columns
-      WHERE table_name = 'sales'
-      ORDER BY column_name
-    `);
-
-    // ✅ Step 4: Return combined info
-    res.json({
-      ...info,
-      sales_columns: cols.rows.map(r => r.column_name)
-    });
-
-  } catch (err) {
-    console.error('/debug-sales-columns error:', err && err.message);
-    res.status(500).json({ error: String(err?.message || err) });
-  }
-});
-
 
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
