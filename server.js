@@ -1678,7 +1678,7 @@ console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
 
 (async () => {
   try {
-    const r = await pool.query("SELECT current_database() AS db, current_user() AS user, inet_server_addr() AS host, inet_server_port() AS port");
+    const r = await pool.query("SELECT current_database() AS db, current_user AS user, inet_server_addr() AS host, inet_server_port() AS port");
     console.warn('[startup] connected db=', r.rows[0]);
   } catch (e) {
     console.warn('[startup] db check failed', e.message || e);
@@ -1688,13 +1688,13 @@ console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
 // debug endpoint to inspect which DB the running server sees
 app.get('/debug-sales-columns', async (req, res) => {
   try {
-    const info = await pool.query("SELECT current_database() AS db, current_user() AS user, inet_server_addr() AS host, inet_server_port() AS port");
+    const infoRes = await pool.query("SELECT current_database() AS db, current_user AS user");
     const cols = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'sales' ORDER BY column_name");
     res.json({
-      database: info.rows[0]?.db || null,
-      user: info.rows[0]?.user || null,
-      host: info.rows[0]?.host || null,
-      port: info.rows[0]?.port || null,
+      database: infoRes.rows[0]?.db || null,
+      user: infoRes.rows[0]?.user || null,
+      host: infoRes.rows[0]?.host || null,
+      port: infoRes.rows[0]?.port || null,
       sales_columns: cols.rows.map(r => r.column_name)
     });
   } catch (err) {
