@@ -1712,30 +1712,44 @@ console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
 // debug endpoint to inspect which DB the running server sees
 app.get('/debug-sales-columns', async (req, res) => {
   try {
-    // minimal info first
-    const infoRes = await pool.query("SELECT current_database() AS db, current_user() AS user");
-    const info = { database: infoRes.rows[0]?.db || null, user: infoRes.rows[0]?.user || null };
+    // ✅ Step 1: Basic DB info (always works)
+    const infoRes = await pool.query("SELECT current_database() AS db, current_user AS user");
+    const info = {
+      database: infoRes.rows[0]?.db || null,
+      user: infoRes.rows[0]?.user || null
+    };
 
-    // try inet_server_* but do not fail if unavailable
+    // ✅ Step 2: Optional host info (try/catch — won’t crash on Render)
     try {
       const hostRes = await pool.query("SELECT inet_server_addr() AS host, inet_server_port() AS port");
       info.host = hostRes.rows[0]?.host || null;
       info.port = hostRes.rows[0]?.port || null;
     } catch (e) {
-      info.host = null;
-      info.port = null;
+      console.warn("[debug-sales-columns] inet_server_* not supported:", e.message);
+      info.host = "N/A";
+      info.port = "N/A";
     }
 
-    const cols = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'sales' ORDER BY column_name");
+    // ✅ Step 3: Get all sales table columns
+    const cols = await pool.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'sales'
+      ORDER BY column_name
+    `);
+
+    // ✅ Step 4: Return combined info
     res.json({
       ...info,
       sales_columns: cols.rows.map(r => r.column_name)
     });
+
   } catch (err) {
     console.error('/debug-sales-columns error:', err && err.message);
     res.status(500).json({ error: String(err?.message || err) });
   }
 });
+
 
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
