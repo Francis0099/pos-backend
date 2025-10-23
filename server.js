@@ -19,22 +19,9 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false,  // Render requires SSL
+    rejectUnauthorized: false, // Render requires SSL
   },
 });
-
-// DEBUG: log all SQL queries and params so we can see the exact failing statement
-// Move this wrapper right after pool creation so any startup queries are logged
-const _realQuery = pool.query.bind(pool);
-pool.query = async (text, params = []) => {
-  try {
-    console.warn('[SQL QUERY]', typeof text === 'string' ? text.trim().replace(/\s+/g, ' ') : text, params);
-    return await _realQuery(text, params);
-  } catch (err) {
-    console.error('[SQL ERROR]', err.message, { text, params });
-    throw err;
-  }
-};
 
 // quick connection check - prints clear success or error to server console
 (async () => {
@@ -166,8 +153,6 @@ app.get("/products-all-admin", async (req, res) => {
 
 // Example: replace your handler SQL calls with dbQuery(...) so errors are logged with the SQL.
 app.post("/login", async (req, res) => {
-  console.warn('[REQUEST /login] headers=', req.headers);
-  console.warn('[REQUEST /login] body=', req.body);
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ success: false, message: "Missing credentials" });
 
@@ -1678,8 +1663,44 @@ app.post("/refund-sale", async (req, res) => {
 });
 
 
+app.get('/test-db', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Database error');
+  }
+});
+
+// debug: print env + DB connection info at startup
+console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
+
+(async () => {
+  try {
+    const r = await pool.query("SELECT current_database() AS db, current_user() AS user, inet_server_addr() AS host, inet_server_port() AS port");
+    console.warn('[startup] connected db=', r.rows[0]);
+  } catch (e) {
+    console.warn('[startup] db check failed', e.message || e);
+  }
+})();
 
 // debug endpoint to inspect which DB the running server sees
+app.get('/debug-sales-columns', async (req, res) => {
+  try {
+    const info = await pool.query("SELECT current_database() AS db, current_user() AS user, inet_server_addr() AS host, inet_server_port() AS port");
+    const cols = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'sales' ORDER BY column_name");
+    res.json({
+      database: info.rows[0]?.db || null,
+      user: info.rows[0]?.user || null,
+      host: info.rows[0]?.host || null,
+      port: info.rows[0]?.port || null,
+      sales_columns: cols.rows.map(r => r.column_name)
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) });
+  }
+});
 
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
