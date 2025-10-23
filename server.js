@@ -1678,6 +1678,181 @@ app.get('/debug-sales-columns', async (req, res) => {
   }
 });
 
+app.post('/purchase-orders', async (req, res) => {
+  const { supplier_id = null, created_by = null, items = [], notes = null, status = 'placed' } = req.body || {};
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, message: 'items array is required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const poInsert = await client.query(
+      `INSERT INTO purchase_orders(supplier_id, created_by, status, notes) VALUES($1,$2,$3,$4) RETURNING id`,
+      [supplier_id, created_by, status, notes]
+    );
+    const poId = poInsert.rows[0].id;
+
+    let total = 0;
+    for (const it of items) {
+      const qty = Number(it.qty ?? 0);
+      const unit = it.unit || null;
+      const unit_cost = Number(it.unit_cost ?? 0);
+      total += qty * unit_cost;
+
+      await client.query(
+        `INSERT INTO purchase_order_items(po_id, ingredient_id, qty, unit, unit_cost) VALUES($1,$2,$3,$4,$5)`,
+        [poId, it.ingredient_id, qty, unit, unit_cost]
+      );
+    }
+
+    await client.query(`UPDATE purchase_orders SET total = $1 WHERE id = $2`, [total, poId]);
+    await client.query('COMMIT');
+    return res.json({ success: true, id: poId });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('create purchase order error', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// List POs (optional status filter)
+app.get('/purchase-orders', async (req, res) => {
+  try {
+    const { status } = req.query;
+    const rows = await dbQuery(
+      status ? `SELECT * FROM purchase_orders WHERE status = $1 ORDER BY created_at DESC` : `SELECT * FROM purchase_orders ORDER BY created_at DESC`,
+      status ? [status] : []
+    );
+    return res.json(Array.isArray(rows) ? rows : []);
+  } catch (err) {
+    console.error('list purchase orders', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// Get PO details with items
+app.get('/purchase-orders/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
+
+  try {
+    const po = (await dbQuery(`SELECT * FROM purchase_orders WHERE id = $1`, [id]))?.[0] ?? null;
+    if (!po) return res.status(404).json({ success: false, message: 'Not found' });
+
+    const items = await dbQuery(`SELECT * FROM purchase_order_items WHERE po_id = $1 ORDER BY id`, [id]);
+    return res.json({ ...po, items: items || [] });
+  } catch (err) {
+    console.error('get po', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// Receive a purchase order -> increments ingredient stock (transactional), logs additions
+// Body can include received_by (user id) and optionally a items array to override quantities to be received.
+app.put('/purchase-orders/:id/receive', async (req, res) => {
+  const poId = Number(req.params.id);
+  if (!Number.isFinite(poId)) return res.status(400).json({ success: false, message: 'Invalid PO id' });
+
+  const { received_by = null, items: overrideItems = null } = req.body || {};
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const poRow = (await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [poId])).rows[0];
+    if (!poRow) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'PO not found' });
+    }
+    if (poRow.status === 'received') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'PO already received' });
+    }
+    if (poRow.status === 'cancelled') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'PO cancelled' });
+    }
+
+    // load items (use overrideItems when provided)
+    let items = [];
+    if (Array.isArray(overrideItems) && overrideItems.length > 0) {
+      items = overrideItems.map(it => ({ ...it }));
+    } else {
+      const q = await client.query('SELECT * FROM purchase_order_items WHERE po_id = $1 ORDER BY id', [poId]);
+      items = q.rows;
+    }
+
+    // For each item: convert received qty to ingredient inventory units and update ingredient stock
+    for (const it of items) {
+      const ingredientId = Number(it.ingredient_id);
+      const recQty = Number(it.qty ?? 0);
+      const recUnit = it.unit || null;
+
+      if (!Number.isFinite(ingredientId) || !Number.isFinite(recQty)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Invalid item data' });
+      }
+
+      // fetch ingredient row (include piece fields if present)
+      const ingRes = await client.query('SELECT id, stock, unit, piece_amount, piece_unit FROM ingredients WHERE id = $1 FOR UPDATE', [ingredientId]);
+      const ing = ingRes.rows[0];
+      if (!ing) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: `Ingredient ${ingredientId} not found` });
+      }
+
+      // convert received quantity -> ingredient.inventory unit using server helper
+      const converted = convertToInventoryUnits(recQty, recUnit, ing.unit, ing);
+      if (!Number.isFinite(converted) || Number.isNaN(converted)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: `Cannot convert ${recQty} ${recUnit} to ingredient ${ing.unit} for ingredient id ${ingredientId}` });
+      }
+
+      // update ingredient stock
+      await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [converted, ingredientId]);
+
+      // log addition
+      await client.query(
+        `INSERT INTO ingredient_additions (ingredient_id, amount, unit, source, purchase_order_id, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [ingredientId, converted, ing.unit, 'purchase_order', poId, received_by]
+      );
+    }
+
+    // mark PO as received and set received timestamp
+    await client.query(`UPDATE purchase_orders SET status = 'received' WHERE id = $1`, [poId]);
+
+    await client.query('COMMIT');
+    return res.json({ success: true, message: 'PO received and stock updated' });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('receive po error', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Cancel a PO
+app.put('/purchase-orders/:id/cancel', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
+  try {
+    const q = await dbQuery(`UPDATE purchase_orders SET status = 'cancelled' WHERE id = $1 RETURNING id`, [id]);
+    if (!q || q.length === 0) return res.status(404).json({ success: false, message: 'Not found' });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('cancel po', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ...existing code...
+
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
