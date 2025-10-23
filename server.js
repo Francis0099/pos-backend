@@ -1691,23 +1691,27 @@ console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
 
 (async () => {
   try {
-    // safe minimal check first
-    const r = await pool.query("SELECT current_database() AS db, current_user() AS user");
+    // ✅ Step 1: Safe minimal DB check
+    const r = await pool.query("SELECT current_database() AS db, current_user AS user");
     const info = r.rows[0] || {};
-    // attempt inet_server_* in a separate try/catch (some PG setups disallow or don't support these)
+
+    // ✅ Step 2: Optional host/port info (some setups don’t support inet_server_*)
     try {
       const hostRes = await pool.query("SELECT inet_server_addr() AS host, inet_server_port() AS port");
       info.host = hostRes.rows[0]?.host || null;
       info.port = hostRes.rows[0]?.port || null;
     } catch (e) {
-      info.host = null;
-      info.port = null;
+      console.warn("[startup] inet_server_* not supported:", e.message);
+      info.host = "N/A";
+      info.port = "N/A";
     }
+
     console.warn('[startup] connected db=', info);
   } catch (e) {
     console.warn('[startup] db check failed', e.message || e);
   }
 })();
+
 
 // debug endpoint to inspect which DB the running server sees
 app.get('/debug-sales-columns', async (req, res) => {
