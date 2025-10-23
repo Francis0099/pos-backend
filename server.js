@@ -1677,32 +1677,6 @@ app.get('/debug-sales-columns', async (req, res) => {
     res.status(500).json({ error: String(err?.message || err) });
   }
 });
-app.get("/ingredient-usage-rows", async (req, res) => {
-  try {
-    const onlyToday = String(req.query.today || "").toLowerCase() === "true";
-    const where = onlyToday ? "WHERE DATE(u.created_at) = CURRENT_DATE" : "";
-    const sql = `
-      SELECT
-        u.created_at AS date,
-        i.id AS ingredient_id,
-        i.name AS ingredient,
-        u.product_id,
-        COALESCE(p.name, 'Manual Deduction') AS product_name,
-        u.amount_used AS amount
-      FROM ingredient_usage u
-      JOIN ingredients i ON u.ingredient_id = i.id
-      LEFT JOIN products p ON u.product_id = p.id
-      ${where}
-      ORDER BY u.created_at DESC
-      LIMIT 1000
-    `;
-    const { rows } = await pool.query(sql);
-    res.json(rows || []);
-  } catch (err) {
-    console.error("❌ Error fetching ingredient usage rows:", err);
-    res.status(500).json({ success: false, message: "Database error" });
-  }
-});
 
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
