@@ -215,26 +215,12 @@ app.post('/submit-order', async (req, res) => {
   }
 
   // Normalize items: [{ id, quantity }]
-  const normalizedItems = items.map((it) => ({ id: Number(it.id), quantity: Number(it.quantity || 1) }));
+  const normalizedItems = items.map((it) => ({ id: Number(it.id), quantity: Number(it.quantity || 1), unit_price: Number(it.unit_price ?? it.price ?? 0) }));
 
-  // Derive subtotal: prefer clientSubtotal if provided and valid, otherwise compute from DB product prices
-  let subtotal = Number(clientSubtotal ?? NaN);
-  const clientSupplied = Number.isFinite(subtotal) && subtotal >= 0;
+  console.warn('[SUBMIT_ORDER] normalizedItems=', normalizedItems, 'clientSubtotal=', clientSubtotal, 'paymentMode=', paymentMode);
 
   const client = await pool.connect();
   try {
-    if (!clientSupplied) {
-      // Compute subtotal from product prices in DB (defensive)
-      const ids = [...new Set(normalizedItems.map((i) => i.id))];
-      const q = await client.query(`SELECT id, price FROM products WHERE id = ANY($1::int[])`, [ids]);
-      const priceMap = new Map(q.rows.map((r) => [Number(r.id), Number(r.price || 0)]));
-      subtotal = normalizedItems.reduce((s, it) => s + (priceMap.get(it.id) ?? 0) * it.quantity, 0);
-    }
-
-    if (!Number.isFinite(subtotal) || subtotal < 0) {
-      return res.status(400).json({ success: false, message: 'Invalid subtotal' });
-    }
-
     // tax configuration
     const TAX_RATE = Number(process.env.TAX_RATE ?? 0.12);
     const TAX_INCLUSIVE = String(process.env.TAX_INCLUSIVE || 'false').toLowerCase() === 'true';
@@ -242,7 +228,7 @@ app.post('/submit-order', async (req, res) => {
 
     // compute subtotal (client may send inclusive price total or net)
     // `subtotal` variable should be the number passed from client (the visible/entered amount)
-    let subtotalNet = Number(subtotal || 0);
+    let subtotalNet = Number(clientSubtotal || 0);
     let taxAmount = 0;
     let totalAmount = 0;
 
@@ -268,9 +254,9 @@ app.post('/submit-order', async (req, res) => {
     const saleRes = await client.query(saleInsertSql, [subtotalNet, taxAmount, totalAmount, paymentMode]);
     const saleId = saleRes.rows[0].id;
 
-    // insert sale_items and record usages per item
-    for (const it of items) {
-      const unitPrice = Number(it.unit_price ?? it.price ?? 0);
+    // insert sale_items and record usages per normalized item (ensures numeric fields)
+    for (const it of normalizedItems) {
+      const unitPrice = Number(it.unit_price ?? 0);
       await client.query(
         "INSERT INTO sale_items (product_id, quantity, unit_price, sale_id) VALUES ($1, $2, $3, $4)",
         [it.id, it.quantity, unitPrice, saleId]
@@ -286,6 +272,8 @@ app.post('/submit-order', async (req, res) => {
       `;
       const ingrRes = await client.query(ingrSql, [it.id]);
 
+      console.warn('[SUBMIT_ORDER] product_id=', it.id, 'foundIngredients=', ingrRes.rows.length);
+
       for (const r of ingrRes.rows) {
         const amountNeeded = Number(r.amount_needed || 0) * Number(it.quantity || 1);
         // convert product-unit amountNeeded -> inventory units
@@ -294,6 +282,7 @@ app.post('/submit-order', async (req, res) => {
           piece_unit: r.piece_unit,
         });
         const amountUsed = Number.isFinite(converted) ? converted : amountNeeded;
+        console.warn('[SUBMIT_ORDER] ingredient=', r.ingredient_id, 'amountNeeded=', amountNeeded, 'amountUsed=', amountUsed);
 
         // decrement ingredient stock and insert usage row
         await client.query(
