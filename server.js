@@ -235,108 +235,95 @@ app.post('/submit-order', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid subtotal' });
     }
 
-    const tax = +(subtotal * 0.12);
-    const total = +(subtotal + tax);
+    // tax configuration
+    const TAX_RATE = Number(process.env.TAX_RATE ?? 0.12);
+    const TAX_INCLUSIVE = String(process.env.TAX_INCLUSIVE || 'false').toLowerCase() === 'true';
+    const round2 = (v) => Math.round(Number(v || 0) * 100) / 100;
 
-    await client.query('BEGIN');
+    // compute subtotal (client may send inclusive price total or net)
+    // `subtotal` variable should be the number passed from client (the visible/entered amount)
+    let subtotalNet = Number(subtotal || 0);
+    let taxAmount = 0;
+    let totalAmount = 0;
 
-    // Detect whether sales table has subtotal_amount / tax_amount columns.
-    // If present, try the full insert; if it fails due to missing column, fallback to simple insert.
-    let saleRes;
-    try {
-      const colsQ = await client.query(
-        `SELECT column_name
-         FROM information_schema.columns
-         WHERE table_name = 'sales'
-           AND column_name IN ('subtotal_amount', 'tax_amount')`
-      );
-      const colNames = (colsQ.rows || []).map(r => String(r.column_name).toLowerCase());
-      console.log("submit-order: detected sales columns:", colNames);
-
-      const hasSubtotal = colNames.includes('subtotal_amount');
-      const hasTax = colNames.includes('tax_amount');
-
-      if (hasSubtotal && hasTax) {
-        try {
-          saleRes = await client.query(
-            `INSERT INTO sales (total_amount, subtotal_amount, tax_amount, payment_mode, created_at)
-             VALUES ($1, $2, $3, $4, NOW()) RETURNING id`,
-            [total, subtotal, tax, (paymentMode || 'CASH')]
-          );
-        } catch (errInsert) {
-          // If insert failed because columns really don't exist (or other DB mismatch), log and fallback
-          console.warn("submit-order: full insert failed, falling back to simple insert. error:", errInsert.message || errInsert);
-          saleRes = await client.query(
-            `INSERT INTO sales (total_amount, payment_mode, created_at)
-             VALUES ($1, $2, NOW()) RETURNING id`,
-            [total, (paymentMode || 'CASH')]
-          );
-        }
-      } else {
-        // fallback to older schema: only store total and payment_mode
-        console.log("submit-order: subtotal/tax columns not present, using simple insert");
-        saleRes = await client.query(
-          `INSERT INTO sales (total_amount, payment_mode, created_at)
-           VALUES ($1, $2, NOW()) RETURNING id`,
-          [total, (paymentMode || 'CASH')]
-        );
-      }
-    } catch (err) {
-      // if information_schema query fails for any reason, try the simple insert as a safe fallback
-      console.warn('submit-order: sales column detection failed, falling back to simple insert', err && err.message);
-      saleRes = await client.query(
-        `INSERT INTO sales (total_amount, payment_mode, created_at)
-         VALUES ($1, $2, NOW()) RETURNING id`,
-        [total, (paymentMode || 'CASH')]
-      );
+    if (TAX_INCLUSIVE) {
+      // client subtotal includes tax -> extract net and tax portion
+      totalAmount = round2(subtotalNet);
+      subtotalNet = round2(subtotalNet / (1 + TAX_RATE));
+      taxAmount = round2(totalAmount - subtotalNet);
+    } else {
+      // client subtotal is net -> compute tax on top
+      subtotalNet = round2(subtotalNet);
+      taxAmount = round2(subtotalNet * TAX_RATE);
+      totalAmount = round2(subtotalNet + taxAmount);
     }
+
+    // begin transaction and persist sale + items and record ingredient usage
+    await client.query("BEGIN");
+    const saleInsertSql = `
+      INSERT INTO sales (subtotal_amount, tax, total_amount, payment_mode, created_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      RETURNING id
+    `;
+    const saleRes = await client.query(saleInsertSql, [subtotalNet, taxAmount, totalAmount, paymentMode]);
     const saleId = saleRes.rows[0].id;
 
-    // Insert sale_items
-    for (const it of normalizedItems) {
+    // insert sale_items and record usages per item
+    for (const it of items) {
+      const unitPrice = Number(it.unit_price ?? it.price ?? 0);
       await client.query(
-        `INSERT INTO sale_items (sale_id, product_id, quantity, unit_price)
-         VALUES ($1, $2, $3,
-           (SELECT price FROM products WHERE id = $2)
-         )`,
-        [saleId, it.id, it.quantity]
+        "INSERT INTO sale_items (product_id, quantity, unit_price, sale_id) VALUES ($1, $2, $3, $4)",
+        [it.id, it.quantity, unitPrice, saleId]
       );
 
-      // Deduct ingredients logic: fetch product_ingredients -> convert units -> deduct inventory
-      // (Reuse your existing ingredient deduction logic here)
-      const ingQ = await client.query(
-        `SELECT pi.ingredient_id, pi.amount_needed, pi.amount_unit, i.unit AS ingredient_unit, i.piece_amount, i.piece_unit
-         FROM product_ingredients pi
-         JOIN ingredients i ON pi.ingredient_id = i.id
-         WHERE pi.product_id = $1`,
-        [it.id]
-      );
+      // fetch product ingredients and ingredient inventory metadata
+      const ingrSql = `
+        SELECT pi.ingredient_id, pi.amount_needed, COALESCE(pi.amount_unit, i.unit) AS product_unit,
+               i.unit AS inventory_unit, i.piece_amount, i.piece_unit
+        FROM product_ingredients pi
+        JOIN ingredients i ON pi.ingredient_id = i.id
+        WHERE pi.product_id = $1
+      `;
+      const ingrRes = await client.query(ingrSql, [it.id]);
 
-      for (const ing of ingQ.rows) {
-        // amount_needed is per single product unit; multiply by quantity
-        const needAmount = Number(ing.amount_needed || 0) * Number(it.quantity || 1);
+      for (const r of ingrRes.rows) {
+        const amountNeeded = Number(r.amount_needed || 0) * Number(it.quantity || 1);
+        // convert product-unit amountNeeded -> inventory units
+        const converted = convertToInventoryUnits(amountNeeded, r.product_unit, r.inventory_unit, {
+          piece_amount: r.piece_amount,
+          piece_unit: r.piece_unit,
+        });
+        const amountUsed = Number.isFinite(converted) ? converted : amountNeeded;
 
-        // convert to inventory units using your helper convertToInventoryUnits (assumed present in server.js)
-        const converted = convertToInventoryUnits(needAmount, ing.amount_unit, ing.ingredient_unit, { piece_amount: ing.piece_amount, piece_unit: ing.piece_unit });
-
-        if (!Number.isFinite(converted) || converted <= 0) {
-          // If conversion fails, log and continue (or choose to rollback)
-          console.warn(`Ingredient conversion failed for product ${it.id} ingredient ${ing.ingredient_id}`);
-          continue;
-        }
-
-        // Deduct from inventory: update ingredients table (assumes 'stock' column stores numeric inventory amount)
+        // decrement ingredient stock and insert usage row
         await client.query(
-          `UPDATE ingredients SET stock = stock - $1 WHERE id = $2`,
-          [converted, ing.ingredient_id]
+          "UPDATE ingredients SET stock = stock - $1 WHERE id = $2",
+          [amountUsed, r.ingredient_id]
+        );
+        await client.query(
+          `INSERT INTO ingredient_usage (sale_id, product_id, ingredient_id, amount_used, created_at)
+           VALUES ($1, $2, $3, $4, NOW())`,
+          [saleId, it.id, r.ingredient_id, amountUsed]
         );
       }
     }
 
-    await client.query('COMMIT');
-    return res.json({ success: true, message: 'Order recorded', saleId, subtotal, tax, total });
+    await client.query("COMMIT");
+
+    // return clear numeric fields to client (subtotal = net, tax, total = shown-to-customer)
+    res.json({
+      success: true,
+      message: "Order created",
+      sale: {
+        id: saleId,
+        subtotal_amount: subtotalNet,
+        tax_amount: taxAmount,
+        total_amount: totalAmount,
+        payment_mode: paymentMode
+      }
+    });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query("ROLLBACK");
     console.error('❌ submit-order error:', err && (err.stack || err));
     return res.status(500).json({ success: false, message: 'Order failed', error: String(err && err.message || err) });
   } finally {
