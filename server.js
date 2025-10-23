@@ -166,6 +166,8 @@ app.get("/products-all-admin", async (req, res) => {
 
 // Example: replace your handler SQL calls with dbQuery(...) so errors are logged with the SQL.
 app.post("/login", async (req, res) => {
+  console.warn('[REQUEST /login] headers=', req.headers);
+  console.warn('[REQUEST /login] body=', req.body);
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ success: false, message: "Missing credentials" });
 
