@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { Pool } = require("pg");
-const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
 const app = express();
@@ -1263,7 +1262,7 @@ app.get("/sales-report", async (req, res) => {
     const { rows } = await pool.query(sql);
     res.json(rows);
   } catch (err) {
-    console.error("❌ /sales-report error:", err);
+    console.error('❌ /sales-report error:', err);
     res.status(500).json({ success: false, message: "Database error" });
   }
 });
