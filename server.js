@@ -1971,7 +1971,13 @@ app.delete('/devices/:id', async (req, res) => {
 // ----------------- OTP helpers and endpoints -----------------
 let twilioClient = null;
 if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-  try { twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); } catch(e){ twilioClient = null; }
+  try {
+    if (!process.env.TWILIO_FROM) throw new Error('TWILIO_FROM not set');
+    twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  } catch (e) {
+    twilioClient = null;
+    console.warn('Twilio disabled:', e && e.message ? e.message : e);
+  }
 }
 
 const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 5 * 60 * 1000); // default 5 min
@@ -2261,8 +2267,8 @@ app.post('/admin/send-test-otp', adminAuth, async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
   console.log('Provider availability:', {
-    twilio: !!process.env.TWILIO_ACCOUNT_SID && !!process.env.TWILIO_AUTH_TOKEN && !!process.env.TWILIO_FROM,
-    smtp: !!process.env.SMTP_USER && !!process.env.SMTP_PASS,
+    twilio: !!twilioClient,
+    smtp: !!(process.env.SMTP_USER && process.env.SMTP_PASS && process.env.SMTP_HOST),
     admin_key: !!process.env.ADMIN_KEY
   });
 });
