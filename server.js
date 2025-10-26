@@ -1,4 +1,33 @@
 require('dotenv').config();
+
+// normalize env strings (remove trailing spaces) and canonicalize SMTP_SECURE
+Object.keys(process.env).forEach(k => {
+  if (typeof process.env[k] === 'string') process.env[k] = process.env[k].trim();
+});
+process.env.SMTP_SECURE = String(process.env.SMTP_SECURE || 'false').toLowerCase();
+
+// --- ADDED: global error handlers + lightweight startup diagnostics (safe) ---
+process.on('uncaughtException', (err) => {
+  console.error('FATAL: uncaughtException:', err && (err.stack || err));
+  // give logs a moment to flush then exit
+  setTimeout(() => process.exit(1), 1000);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('FATAL: unhandledRejection:', reason && (reason.stack || reason));
+  setTimeout(() => process.exit(1), 1000);
+});
+
+
+// Lightweight module presence checks (do not require optional modules)
+try {
+  try { require.resolve('twilio'); console.log('module: twilio installed'); }
+  catch (e) { console.log('module: twilio NOT installed'); }
+  try { require.resolve('nodemailer'); console.log('module: nodemailer installed'); }
+  catch (e) { console.log('module: nodemailer NOT installed'); }
+} catch (e) {
+  console.error('Startup module checks failed:', e && (e.stack || e));
+}
+
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -194,7 +223,6 @@ app.post("/login", async (req, res) => {
     return res.status(500).json({ success: false, message: "Database error", error: err.message, detail: err.stack?.split("\n")[0] });
   }
 });
-
 
 
 
@@ -1834,10 +1862,21 @@ app.post('/purchase-orders', async (req, res) => {
   const { supplier_id = null, items = [] } = req.body || {};
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, message: 'Items required' });
-  }
-
-  const client = await pool.connect();
+ }
   try {
+    // --- ADDED: basic input validation ---
+    for (const it of items) {
+      const qty = Number(it.qty);
+      const cost = Number(it.unit_cost);
+      if (!Number.isFinite(qty) || qty <= 0) {
+        return res.status(400).json({ success: false, message: 'Invalid item quantity' });
+      }
+      if (!Number.isFinite(cost) || cost < 0) {
+        return res.status(400).json({ success: false, message: 'Invalid item cost' });
+      }
+    }
+
+    const client = await pool.connect();
     await client.query('BEGIN');
 
     // calculate total (sum qty * unit_cost) safely
