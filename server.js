@@ -2257,3 +2257,13 @@ app.post('/admin/send-test-otp', adminAuth, async (req, res) => {
   }
 });
 
+// Start HTTP server (ensure this is present once at the end of the file)
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
+  console.log('Provider availability:', {
+    twilio: !!process.env.TWILIO_ACCOUNT_SID && !!process.env.TWILIO_AUTH_TOKEN && !!process.env.TWILIO_FROM,
+    smtp: !!process.env.SMTP_USER && !!process.env.SMTP_PASS,
+    admin_key: !!process.env.ADMIN_KEY
+  });
+});
+
