@@ -1698,6 +1698,97 @@ app.put('/purchase-orders/:id/cancel', async (req, res) => {
   }
 });
 
+// List purchase orders (basic fields + items)
+app.get('/purchase-orders', async (req, res) => {
+  try {
+    const ordersRes = await pool.query(
+      `SELECT id, supplier_id, created_by, status, total, notes, created_at
+       FROM purchase_orders
+       ORDER BY created_at DESC`
+    );
+    const orders = ordersRes.rows || [];
+
+    // load items for all orders in one query
+    const orderIds = orders.map(o => o.id);
+    let items = [];
+    if (orderIds.length > 0) {
+      const itemsRes = await pool.query(
+        `SELECT poi.*, i.name AS ingredient_name
+         FROM purchase_order_items poi
+         LEFT JOIN ingredients i ON i.id = poi.ingredient_id
+         WHERE poi.po_id = ANY($1::int[])
+         ORDER BY poi.id`,
+        [orderIds]
+      );
+      items = itemsRes.rows || [];
+    }
+
+    // attach items to their orders
+    const byOrder = {};
+    for (const it of items) {
+      const key = String(it.po_id);
+      byOrder[key] = byOrder[key] || [];
+      byOrder[key].push({
+        id: it.id,
+        ingredient_id: it.ingredient_id,
+        ingredient_name: it.ingredient_name,
+        qty: it.qty,
+        unit: it.unit,
+        unit_cost: it.unit_cost,
+        created_at: it.created_at
+      });
+    }
+
+    const out = orders.map(o => ({
+      ...o,
+      items: byOrder[String(o.id)] || []
+    }));
+
+    return res.json(out);
+  } catch (err) {
+    console.error('❌ /purchase-orders error:', err && (err.message || err));
+    return res.status(500).json({ success: false, message: 'Failed to fetch purchase orders', error: String(err && err.message || err) });
+  }
+});
+
+// Get single purchase order with items
+app.get('/purchase-orders/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const poRes = await pool.query(
+      `SELECT id, supplier_id, created_by, status, total, notes, created_at
+       FROM purchase_orders WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+    if (poRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Purchase order not found' });
+    const po = poRes.rows[0];
+
+    const itemsRes = await pool.query(
+      `SELECT poi.*, i.name AS ingredient_name
+       FROM purchase_order_items poi
+       LEFT JOIN ingredients i ON i.id = poi.ingredient_id
+       WHERE poi.po_id = $1
+       ORDER BY poi.id`,
+      [id]
+    );
+
+    po.items = (itemsRes.rows || []).map(it => ({
+      id: it.id,
+      ingredient_id: it.ingredient_id,
+      ingredient_name: it.ingredient_name,
+      qty: it.qty,
+      unit: it.unit,
+      unit_cost: it.unit_cost,
+      created_at: it.created_at
+    }));
+
+    return res.json(po);
+  } catch (err) {
+    console.error('❌ /purchase-orders/:id error:', err && (err.message || err));
+    return res.status(500).json({ success: false, message: 'Failed to fetch purchase order', error: String(err && err.message || err) });
+  }
+});
+
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
