@@ -2210,7 +2210,13 @@ app.post('/admin/send-test-otp', adminAuth, async (req, res) => {
       if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
         return res.status(500).json({ success: false, message: 'SMTP not configured' });
       }
-      const nodemailer = require('nodemailer');
+      let nodemailer;
+      try {
+        nodemailer = require('nodemailer');
+      } catch (err) {
+        console.error('nodemailer missing:', err);
+        return res.status(500).json({ success: false, message: 'nodemailer module not installed on server. Run: npm install nodemailer' });
+      }
       const transporter = nodemailer.createTransport({
         host: process.env.SMTP_HOST || 'smtp.gmail.com',
         port: Number(process.env.SMTP_PORT || 587),
@@ -2221,7 +2227,7 @@ app.post('/admin/send-test-otp', adminAuth, async (req, res) => {
         from: process.env.SMTP_FROM || process.env.SMTP_USER,
         to: identifier,
         subject: 'Test OTP',
-        text: `Your test OTP is: ${code} (expires in ${Math.round((Number(process.env.OTP_TTL_MS||300000)/60000))} minutes)`,
+        text: `Your test OTP is: ${code} (expires in ${Math.round(OTP_TTL_MS/60000)} minutes)`,
       });
       return res.json({ success: true, method: 'email', message: 'OTP sent by email' });
     } else {
@@ -2229,7 +2235,13 @@ app.post('/admin/send-test-otp', adminAuth, async (req, res) => {
       if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_FROM) {
         return res.status(500).json({ success: false, message: 'Twilio not configured' });
       }
-      const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+      let twilio;
+      try {
+        twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+      } catch (err) {
+        console.error('twilio module missing:', err);
+        return res.status(500).json({ success: false, message: 'twilio module not installed on server. Run: npm install twilio' });
+      }
       await twilio.messages.create({
         body: `Your test OTP is: ${code}`,
         from: process.env.TWILIO_FROM,
