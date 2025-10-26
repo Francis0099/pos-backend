@@ -3,6 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { Pool } = require("pg");
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors({
@@ -1871,8 +1873,93 @@ app.post('/purchase-orders', async (req, res) => {
   }
 });
 
-// ✅ Start server
-const PORT = process.env.PORT || 3000;
+// --- simplified PIN auth (revert to a basic "type 1" PIN flow) ---
+// Note: this stores/checks a plain text PIN in users.pin for simplicity.
+// It's easier for the client but less secure — consider hashing later.
+app.post('/set-pin', async (req, res) => {
+  const { username, pin } = req.body || {};
+  if (!username || !pin) return res.status(400).json({ success: false, message: 'username and pin required' });
+
+  try {
+    // ensure users table has `pin` column. If not present, run:
+    // ALTER TABLE users ADD COLUMN pin text;
+    const update = await pool.query('UPDATE users SET pin = $1 WHERE username = $2 RETURNING id, username, role', [String(pin), username]);
+    if (update.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    return res.json({ success: true, message: 'PIN set' , user: update.rows[0]});
+  } catch (err) {
+    console.error('/set-pin error', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// Login with simple PIN
+app.post('/login-pin', async (req, res) => {
+  const { username, pin, device_id } = req.body || {};
+  if (!username || !pin) return res.status(400).json({ success: false, message: 'username and pin required' });
+
+  try {
+    // check device allowlist if populated
+    if (device_id) {
+      const allowRes = await pool.query('SELECT id FROM devices WHERE allowed = true LIMIT 1');
+      if (allowRes.rowCount > 0) {
+        const ok = (await pool.query('SELECT id FROM devices WHERE device_id = $1 AND allowed = true LIMIT 1', [device_id])).rowCount > 0;
+        if (!ok) return res.status(403).json({ success: false, message: 'Device not allowed' });
+      }
+    }
+
+    const r = await pool.query('SELECT id, username, role, pin FROM users WHERE username = $1 LIMIT 1', [username]);
+    if (r.rowCount === 0) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    const user = r.rows[0];
+    if (!user.pin || String(user.pin) !== String(pin)) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
+    return res.json({ success: true, id: user.id, username: user.username, role: user.role });
+  } catch (err) {
+    console.error('/login-pin error', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// --- device allowlist management (admin only recommended) ---
+app.post('/devices', async (req, res) => {
+  const { device_id, description, allowed = true } = req.body || {};
+  if (!device_id) return res.status(400).json({ success: false, message: 'device_id required' });
+  try {
+    const r = await pool.query(
+      `INSERT INTO devices (device_id, description, allowed, created_at)
+       VALUES ($1, $2, $3, NOW()) RETURNING id, device_id, description, allowed`,
+      [device_id, description || null, allowed]
+    );
+    return res.status(201).json({ success: true, device: r.rows[0] });
+  } catch (err) {
+    console.error('/devices POST', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.get('/devices', async (_req, res) => {
+  try {
+    const r = await pool.query('SELECT id, device_id, description, allowed, created_at FROM devices ORDER BY created_at DESC');
+    return res.json(r.rows || []);
+  } catch (err) {
+    console.error('/devices GET', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.delete('/devices/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query('DELETE FROM devices WHERE id = $1', [id]);
+    return res.json({ success: true, id });
+  } catch (err) {
+    console.error('/devices DELETE', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
 });
