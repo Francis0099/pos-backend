@@ -24,6 +24,9 @@ const pool = new Pool({
   },
 });
 
+// ensure PORT is defined (add this)
+const PORT = process.env.PORT || 3000;
+
 // quick connection check - prints clear success or error to server console
 (async () => {
   try {
