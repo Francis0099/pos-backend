@@ -1969,7 +1969,6 @@ app.delete('/devices/:id', async (req, res) => {
 });
 
 // ----------------- OTP helpers and endpoints -----------------
-const nodemailer = require('nodemailer');
 let twilioClient = null;
 if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
   try { twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); } catch(e){ twilioClient = null; }
