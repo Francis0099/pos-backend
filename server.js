@@ -1968,8 +1968,168 @@ app.delete('/devices/:id', async (req, res) => {
   }
 });
 
+// ----------------- OTP helpers and endpoints -----------------
+const nodemailer = require('nodemailer');
+let twilioClient = null;
+if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  try { twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); } catch(e){ twilioClient = null; }
+}
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
+const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 5 * 60 * 1000); // default 5 min
+
+async function sendOtpViaSms(phone, code) {
+  if (!twilioClient) throw new Error('Twilio not configured');
+  // TWILIO_FROM must be set
+  return twilioClient.messages.create({ body: `Your OTP: ${code}`, from: process.env.TWILIO_FROM, to: phone });
+}
+
+async function sendOtpViaEmail(email, code) {
+  // SMTP_* env: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) throw new Error('SMTP not configured');
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+  return transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: 'Your OTP code',
+    text: `Your OTP code is: ${code}. It expires in ${Math.round(OTP_TTL_MS/60000)} minutes.`,
+  });
+}
+
+async function storeOtp(client, identifier, code, ttlMs = OTP_TTL_MS) {
+  const expiresAt = new Date(Date.now() + ttlMs);
+  const q = await client.query(
+    `INSERT INTO otps (identifier, code, expires_at, used, created_at)
+     VALUES ($1, $2, $3, false, NOW()) RETURNING id`,
+    [identifier, String(code), expiresAt]
+  );
+  return q.rows[0];
+}
+
+/*
+DB: create otps table (run once)
+CREATE TABLE IF NOT EXISTS otps (
+  id serial PRIMARY KEY,
+  identifier text NOT NULL,
+  code text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  used boolean DEFAULT false,
+  created_at timestamptz DEFAULT NOW()
+);
+*/
+
+// Request OTP (identifier: phone or email). provider auto chosen by format/env.
+app.post('/auth/request-otp', async (req, res) => {
+  const { identifier } = req.body || {};
+  if (!identifier) return res.status(400).json({ success: false, message: 'identifier required (phone or email)' });
+
+  const client = await pool.connect();
+  try {
+    // generate 6-digit code
+    const code = (Math.floor(100000 + Math.random() * 900000)).toString();
+
+    // store code
+    await storeOtp(client, identifier, code);
+
+    // send via appropriate channel: simple detection by @ for email
+    if (String(identifier).includes('@')) {
+      await sendOtpViaEmail(identifier, code);
+    } else {
+      if (!twilioClient) {
+        console.warn('Twilio not configured, cannot SMS OTP');
+        // still return success but warn client
+        return res.status(500).json({ success: false, message: 'SMS provider not configured' });
+      }
+      await sendOtpViaSms(identifier, code);
+    }
+
+    return res.json({ success: true, message: 'OTP sent' });
+  } catch (err) {
+    console.error('/auth/request-otp error', err);
+    return res.status(500).json({ success: false, message: 'Failed to send OTP', error: String(err.message || err) });
+  } finally {
+    client.release();
+  }
+});
+
+// Receive PO with OTP verification and update stock + recalc total
+// POST /purchase-orders/:id/receive-with-otp { identifier, code }
+app.post('/purchase-orders/:id/receive-with-otp', async (req, res) => {
+  const { id } = req.params;
+  const { identifier, code } = req.body || {};
+  if (!identifier || !code) return res.status(400).json({ success: false, message: 'identifier and code required' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // verify OTP: most recent for identifier
+    const otpRes = await client.query(
+      `SELECT id, code, expires_at, used FROM otps WHERE identifier = $1 ORDER BY created_at DESC LIMIT 1`,
+      [identifier]
+    );
+    const otpRow = otpRes.rows[0];
+    if (!otpRow) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
+    }
+    if (otpRow.used) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'OTP already used' });
+    }
+    if (String(otpRow.code) !== String(code) || new Date(otpRow.expires_at) < new Date()) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    // mark OTP used
+    await client.query('UPDATE otps SET used = true WHERE id = $1', [otpRow.id]);
+
+    // lock PO
+    const poRes = await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
+    if (poRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Purchase order not found' });
+    }
+    const po = poRes.rows[0];
+    if (po.status === 'received') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Purchase order already received' });
+    }
+
+    // compute total from items (qty * unit_cost)
+    const sumRes = await client.query(`SELECT COALESCE(SUM(COALESCE(qty::numeric,0) * COALESCE(unit_cost::numeric,0)),0) AS total FROM purchase_order_items WHERE po_id = $1`, [id]);
+    const computedTotal = Number(sumRes.rows[0]?.total ?? 0);
+
+    // update purchase_orders total and status
+    await client.query('UPDATE purchase_orders SET total = $1, status = $2 WHERE id = $3', [computedTotal, 'received', id]);
+
+    // update stock and insert additions
+    const itemsRes = await client.query('SELECT ingredient_id, qty FROM purchase_order_items WHERE po_id = $1', [id]);
+    for (const it of itemsRes.rows) {
+      const qty = Number(it.qty || 0);
+      if (qty > 0) {
+        await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [qty, it.ingredient_id]);
+        await client.query(
+          `INSERT INTO ingredient_additions (ingredient_id, amount, date, source)
+           VALUES ($1, $2, NOW(), $3)`,
+          [it.ingredient_id, qty, `PO:${id}`]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    return res.json({ success: true, message: 'PO received', id: Number(id), total: computedTotal });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(()=>{});
+    console.error('❌ receive-with-otp error:', err && (err.message || err));
+    return res.status(500).json({ success: false, message: 'Server error', error: String(err && err.message || err) });
+  } finally {
+    client.release();
+  }
 });
 
