@@ -1754,84 +1754,60 @@ app.get('/purchase-orders/:id', async (req, res) => {
 // Receive a purchase order -> increments ingredient stock (transactional), logs additions
 // Body can include received_by (user id) and optionally a items array to override quantities to be received.
 app.put('/purchase-orders/:id/receive', async (req, res) => {
-  const poId = Number(req.params.id);
-  if (!Number.isFinite(poId)) return res.status(400).json({ success: false, message: 'Invalid PO id' });
-
-  const { received_by = null, items: overrideItems = null } = req.body || {};
-
+  const { id } = req.params;
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    await client.query("BEGIN");
 
-    const poRow = (await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [poId])).rows[0];
-    if (!poRow) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ success: false, message: 'PO not found' });
-    }
-    if (poRow.status === 'received') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'PO already received' });
-    }
-    if (poRow.status === 'cancelled') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'PO cancelled' });
+    // lock PO row
+    const poRes = await client.query("SELECT * FROM purchase_orders WHERE id = $1 FOR UPDATE", [id]);
+    if (poRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Purchase order not found" });
     }
 
-    // load items (use overrideItems when provided)
-    let items = [];
-    if (Array.isArray(overrideItems) && overrideItems.length > 0) {
-      items = overrideItems.map(it => ({ ...it }));
-    } else {
-      const q = await client.query('SELECT * FROM purchase_order_items WHERE po_id = $1 ORDER BY id', [poId]);
-      items = q.rows;
-    }
+    // load PO items
+    const itemsRes = await client.query("SELECT * FROM purchase_order_items WHERE purchase_order_id = $1", [id]);
+    const items = itemsRes.rows;
 
-    // For each item: convert received qty to ingredient inventory units and update ingredient stock
+    // detect which column to use for unit in ingredient_additions (some schemas use different names)
+    const colRes = await client.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'ingredient_additions' AND column_name IN ('unit','unit_name')`
+    );
+    const unitCol = colRes.rows.length ? colRes.rows[0].column_name : null;
+
+    // insert additions and update ingredient stock
     for (const it of items) {
-      const ingredientId = Number(it.ingredient_id);
-      const recQty = Number(it.qty ?? 0);
-      const recUnit = it.unit || null;
-
-      if (!Number.isFinite(ingredientId) || !Number.isFinite(recQty)) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ success: false, message: 'Invalid item data' });
-      }
-
-      // fetch ingredient row (include piece fields if present)
-      const ingRes = await client.query('SELECT id, stock, unit, piece_amount, piece_unit FROM ingredients WHERE id = $1 FOR UPDATE', [ingredientId]);
-      const ing = ingRes.rows[0];
-      if (!ing) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ success: false, message: `Ingredient ${ingredientId} not found` });
-      }
-
-      // convert received quantity -> ingredient.inventory unit using server helper
-      const converted = convertToInventoryUnits(recQty, recUnit, ing.unit, ing);
-      if (!Number.isFinite(converted) || Number.isNaN(converted)) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ success: false, message: `Cannot convert ${recQty} ${recUnit} to ingredient ${ing.unit} for ingredient id ${ingredientId}` });
-      }
+      const qty = Number(it.qty || 0);
+      const unit = it.unit ?? null;
+      const cost = it.unit_cost ?? 0;
 
       // update ingredient stock
-      await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [converted, ingredientId]);
+      await client.query("UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2", [qty, it.ingredient_id]);
 
-      // log addition
-      await client.query(
-        `INSERT INTO ingredient_additions (ingredient_id, amount, unit, source, purchase_order_id, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [ingredientId, converted, ing.unit, 'purchase_order', poId, received_by]
-      );
+      // build insertion for ingredient_additions depending on available column
+      if (unitCol) {
+        const sql = `INSERT INTO ingredient_additions (ingredient_id, qty, ${unitCol}, unit_cost, source, created_at)
+                     VALUES ($1, $2, $3, $4, $5, NOW())`;
+        await client.query(sql, [it.ingredient_id, qty, unit, cost, `PO:${id}`]);
+      } else {
+        // fallback: insert without unit column
+        const sql = `INSERT INTO ingredient_additions (ingredient_id, qty, unit_cost, source, created_at)
+                     VALUES ($1, $2, $3, $4, NOW())`;
+        await client.query(sql, [it.ingredient_id, qty, cost, `PO:${id}`]);
+      }
     }
 
-    // mark PO as received and set received timestamp
-    await client.query(`UPDATE purchase_orders SET status = 'received' WHERE id = $1`, [poId]);
+    // mark purchase order received
+    await client.query("UPDATE purchase_orders SET status = $1, updated_at = NOW() WHERE id = $2", ["received", id]);
 
-    await client.query('COMMIT');
-    return res.json({ success: true, message: 'PO received and stock updated' });
+    await client.query("COMMIT");
+    return res.json({ success: true, message: "PO received", id });
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('receive po error', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("receive PO error", err);
+    return res.status(500).json({ success: false, message: "Server error", error: String(err.message) });
   } finally {
     client.release();
   }
