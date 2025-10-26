@@ -39,7 +39,8 @@ pool.on("error", (err) => {
 
 async function dbQuery(text, params = []) {
   try {
-    return await pool.query(text, params);
+    const result = await pool.query(text, params);
+    return result.rows; // return rows array for callers
   } catch (err) {
     console.error("SQL ERROR:", { text, params, message: err.message, stack: err.stack });
     throw err;
@@ -998,7 +999,6 @@ app.put('/categories/:id', async (req, res) => {
   }
 });
 
-
 // ✅ Delete category (block if referenced by products)
 app.delete('/categories/:id', async (req, res) => {
   const { id } = req.params;
@@ -1850,8 +1850,6 @@ app.put('/purchase-orders/:id/cancel', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
-
-// ...existing code...
 
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
