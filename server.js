@@ -1638,176 +1638,47 @@ app.post("/refund-sale", async (req, res) => {
   }
 });
 
-
-app.get('/test-db', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT NOW()');
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Database error');
-  }
-});
-
-// debug: print env + DB connection info at startup
-console.warn('[startup] DATABASE_URL=', process.env.DATABASE_URL);
-
-(async () => {
-  try {
-    const r = await pool.query("SELECT current_database() AS db, current_user AS user, inet_server_addr() AS host, inet_server_port() AS port");
-    console.warn('[startup] connected db=', r.rows[0]);
-  } catch (e) {
-    console.warn('[startup] db check failed', e.message || e);
-  }
-})();
-
-// debug endpoint to inspect which DB the running server sees
-app.get('/debug-sales-columns', async (req, res) => {
-  try {
-    const infoRes = await pool.query("SELECT current_database() AS db, current_user AS user");
-    const cols = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'sales' ORDER BY column_name");
-    res.json({
-      database: infoRes.rows[0]?.db || null,
-      user: infoRes.rows[0]?.user || null,
-      host: infoRes.rows[0]?.host || null,
-      port: infoRes.rows[0]?.port || null,
-      sales_columns: cols.rows.map(r => r.column_name)
-    });
-  } catch (err) {
-    res.status(500).json({ error: String(err?.message || err) });
-  }
-});
-
-app.post('/purchase-orders', async (req, res) => {
-  const { supplier_id = null, created_by = null, items = [], notes = null, status = 'placed' } = req.body || {};
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ success: false, message: 'items array is required' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const poInsert = await client.query(
-      `INSERT INTO purchase_orders(supplier_id, created_by, status, notes) VALUES($1,$2,$3,$4) RETURNING id`,
-      [supplier_id, created_by, status, notes]
-    );
-    const poId = poInsert.rows[0].id;
-
-    let total = 0;
-    for (const it of items) {
-      const qty = Number(it.qty ?? 0);
-      const unit = it.unit || null;
-      const unit_cost = Number(it.unit_cost ?? 0);
-      total += qty * unit_cost;
-
-      await client.query(
-        `INSERT INTO purchase_order_items(po_id, ingredient_id, qty, unit, unit_cost) VALUES($1,$2,$3,$4,$5)`,
-        [poId, it.ingredient_id, qty, unit, unit_cost]
-      );
-    }
-
-    await client.query(`UPDATE purchase_orders SET total = $1 WHERE id = $2`, [total, poId]);
-    await client.query('COMMIT');
-    return res.json({ success: true, id: poId });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('create purchase order error', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  } finally {
-    client.release();
-  }
-});
-
-// List POs (optional status filter)
-app.get('/purchase-orders', async (req, res) => {
-  try {
-    const { status } = req.query;
-    const rows = await dbQuery(
-      status ? `SELECT * FROM purchase_orders WHERE status = $1 ORDER BY created_at DESC` : `SELECT * FROM purchase_orders ORDER BY created_at DESC`,
-      status ? [status] : []
-    );
-    return res.json(Array.isArray(rows) ? rows : []);
-  } catch (err) {
-    console.error('list purchase orders', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-// Get PO details with items
-app.get('/purchase-orders/:id', async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
-
-  try {
-    const po = (await dbQuery(`SELECT * FROM purchase_orders WHERE id = $1`, [id]))?.[0] ?? null;
-    if (!po) return res.status(404).json({ success: false, message: 'Not found' });
-
-    const items = await dbQuery(`SELECT * FROM purchase_order_items WHERE po_id = $1 ORDER BY id`, [id]);
-    return res.json({ ...po, items: items || [] });
-  } catch (err) {
-    console.error('get po', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-// Receive a purchase order -> increments ingredient stock (transactional), logs additions
-// Body can include received_by (user id) and optionally a items array to override quantities to be received.
+// replace existing app.put('/purchase-orders/:id/receive', ...) handler with this
 app.put('/purchase-orders/:id/receive', async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
   try {
-    await client.query("BEGIN");
+    await client.query('BEGIN');
 
-    // lock PO row
-    const poRes = await client.query("SELECT * FROM purchase_orders WHERE id = $1 FOR UPDATE", [id]);
+    // lock PO
+    const poRes = await client.query('SELECT * FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
     if (poRes.rowCount === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ success: false, message: "Purchase order not found" });
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Purchase order not found' });
     }
 
-    // load PO items
-    const itemsRes = await client.query("SELECT * FROM purchase_order_items WHERE purchase_order_id = $1", [id]);
-    const items = itemsRes.rows;
+    // load items (schema uses po_id)
+    const itemsRes = await client.query('SELECT * FROM purchase_order_items WHERE po_id = $1', [id]);
+    const items = itemsRes.rows || [];
 
-    // detect which column to use for unit in ingredient_additions (some schemas use different names)
-    const colRes = await client.query(
-      `SELECT column_name FROM information_schema.columns
-       WHERE table_name = 'ingredient_additions' AND column_name IN ('unit','unit_name')`
-    );
-    const unitCol = colRes.rows.length ? colRes.rows[0].column_name : null;
-
-    // insert additions and update ingredient stock
+    // update stock and record additions using your schema: (ingredient_id, amount, date, source)
     for (const it of items) {
       const qty = Number(it.qty || 0);
-      const unit = it.unit ?? null;
-      const cost = it.unit_cost ?? 0;
-
       // update ingredient stock
-      await client.query("UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2", [qty, it.ingredient_id]);
+      await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [qty, it.ingredient_id]);
 
-      // build insertion for ingredient_additions depending on available column
-      if (unitCol) {
-        const sql = `INSERT INTO ingredient_additions (ingredient_id, qty, ${unitCol}, unit_cost, source, created_at)
-                     VALUES ($1, $2, $3, $4, $5, NOW())`;
-        await client.query(sql, [it.ingredient_id, qty, unit, cost, `PO:${id}`]);
-      } else {
-        // fallback: insert without unit column
-        const sql = `INSERT INTO ingredient_additions (ingredient_id, qty, unit_cost, source, created_at)
-                     VALUES ($1, $2, $3, $4, NOW())`;
-        await client.query(sql, [it.ingredient_id, qty, cost, `PO:${id}`]);
-      }
+      // insert addition record
+      await client.query(
+        `INSERT INTO ingredient_additions (ingredient_id, amount, date, source)
+         VALUES ($1, $2, NOW(), $3)`,
+        [it.ingredient_id, qty, `PO:${id}`]
+      );
     }
 
-    // mark purchase order received
-    await client.query("UPDATE purchase_orders SET status = $1, updated_at = NOW() WHERE id = $2", ["received", id]);
+    // mark PO received
+    await client.query('UPDATE purchase_orders SET status = $1, updated_at = NOW() WHERE id = $2', ['received', id]);
 
-    await client.query("COMMIT");
-    return res.json({ success: true, message: "PO received", id });
+    await client.query('COMMIT');
+    return res.json({ success: true, message: 'PO received', id });
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("receive PO error", err);
-    return res.status(500).json({ success: false, message: "Server error", error: String(err.message) });
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('receive PO error', err);
+    return res.status(500).json({ success: false, message: 'Server error', error: String(err.message) });
   } finally {
     client.release();
   }
