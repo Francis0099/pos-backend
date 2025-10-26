@@ -1984,8 +1984,14 @@ async function sendOtpViaSms(phone, code) {
 }
 
 async function sendOtpViaEmail(email, code) {
-  // SMTP_* env: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+  // require nodemailer lazily so server won't crash when package isn't installed
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) throw new Error('SMTP not configured');
+  let nodemailer;
+  try {
+    nodemailer = require('nodemailer');
+  } catch (err) {
+    throw new Error('nodemailer module not installed. Run: npm install nodemailer');
+  }
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST || 'smtp.gmail.com',
     port: Number(process.env.SMTP_PORT || 587),
@@ -2128,6 +2134,113 @@ app.post('/purchase-orders/:id/receive-with-otp', async (req, res) => {
     await client.query('ROLLBACK').catch(()=>{});
     console.error('❌ receive-with-otp error:', err && (err.message || err));
     return res.status(500).json({ success: false, message: 'Server error', error: String(err && err.message || err) });
+  } finally {
+    client.release();
+  }
+});
+
+// simple admin auth using an env secret (safe for small internal admin UI)
+function adminAuth(req, res, next) {
+  const key = req.headers['x-admin-key'] || req.body?.admin_key || req.query?.admin_key;
+  if (!process.env.ADMIN_KEY) return res.status(500).json({ success: false, message: 'ADMIN_KEY not configured' });
+  if (!key || String(key) !== String(process.env.ADMIN_KEY)) return res.status(403).json({ success: false, message: 'Forbidden' });
+  next();
+}
+
+// helper: store OTP row
+async function storeOtpRow(client, identifier, code, ttlMs = Number(process.env.OTP_TTL_MS || 300000)) {
+  const expiresAt = new Date(Date.now() + ttlMs);
+  const q = await client.query(
+    `INSERT INTO otps (identifier, code, expires_at, used, created_at)
+     VALUES ($1, $2, $3, false, NOW()) RETURNING id`,
+    [identifier, String(code), expiresAt]
+  );
+  return q.rows[0];
+}
+
+// admin: register/update device (creates or updates by device_id)
+app.post('/admin/devices', adminAuth, async (req, res) => {
+  const { device_id, description = null, allowed = true } = req.body || {};
+  if (!device_id) return res.status(400).json({ success: false, message: 'device_id required' });
+
+  try {
+    // upsert on device_id
+    const q = await pool.query(
+      `INSERT INTO devices (device_id, description, allowed, created_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (device_id) DO UPDATE
+         SET description = EXCLUDED.description, allowed = EXCLUDED.allowed
+       RETURNING id, device_id, description, allowed, created_at`,
+      [device_id, description, allowed]
+    );
+    return res.status(201).json({ success: true, device: q.rows[0] });
+  } catch (err) {
+    console.error('/admin/devices error', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// admin: list devices
+app.get('/admin/devices', adminAuth, async (req, res) => {
+  try {
+    const q = await pool.query('SELECT id, device_id, description, allowed, created_at FROM devices ORDER BY created_at DESC');
+    return res.json({ success: true, devices: q.rows });
+  } catch (err) {
+    console.error('/admin/devices GET error', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// admin: send a test OTP to an identifier (phone or email)
+// body: { identifier: "alice@example.com" } or { identifier: "+15551234567" }
+app.post('/admin/send-test-otp', adminAuth, async (req, res) => {
+  const { identifier } = req.body || {};
+  if (!identifier) return res.status(400).json({ success: false, message: 'identifier required' });
+
+  const client = await pool.connect();
+  try {
+    // generate 6-digit code
+    const code = (Math.floor(100000 + Math.random() * 900000)).toString();
+
+    // store OTP row
+    await storeOtpRow(client, identifier, code);
+
+    // send via email or SMS depending on identifier format
+    if (String(identifier).includes('@')) {
+      // email
+      if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+        return res.status(500).json({ success: false, message: 'SMTP not configured' });
+      }
+      const nodemailer = require('nodemailer');
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST || 'smtp.gmail.com',
+        port: Number(process.env.SMTP_PORT || 587),
+        secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+      await transporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: identifier,
+        subject: 'Test OTP',
+        text: `Your test OTP is: ${code} (expires in ${Math.round((Number(process.env.OTP_TTL_MS||300000)/60000))} minutes)`,
+      });
+      return res.json({ success: true, method: 'email', message: 'OTP sent by email' });
+    } else {
+      // SMS
+      if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_FROM) {
+        return res.status(500).json({ success: false, message: 'Twilio not configured' });
+      }
+      const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+      await twilio.messages.create({
+        body: `Your test OTP is: ${code}`,
+        from: process.env.TWILIO_FROM,
+        to: identifier,
+      });
+      return res.json({ success: true, method: 'sms', message: 'OTP sent by SMS' });
+    }
+  } catch (err) {
+    console.error('/admin/send-test-otp error', err);
+    return res.status(500).json({ success: false, message: 'Failed to send OTP', error: String(err?.message || err) });
   } finally {
     client.release();
   }
