@@ -1898,28 +1898,35 @@ app.post('/set-pin', async (req, res) => {
 
 // Login with simple PIN
 app.post('/login-pin', async (req, res) => {
-  const { username, pin, device_id } = req.body || {};
-  if (!username || !pin) return res.status(400).json({ success: false, message: 'username and pin required' });
+  const { pin, device_id } = req.body || {};
+  if (!pin) return res.status(400).json({ success: false, message: 'pin required' });
 
+  const client = await pool.connect();
   try {
-    // check device allowlist if populated
-    if (device_id) {
-      const allowRes = await pool.query('SELECT id FROM devices WHERE allowed = true LIMIT 1');
-      if (allowRes.rowCount > 0) {
-        const ok = (await pool.query('SELECT id FROM devices WHERE device_id = $1 AND allowed = true LIMIT 1', [device_id])).rowCount > 0;
-        if (!ok) return res.status(403).json({ success: false, message: 'Device not allowed' });
+    // If a device allowlist exists (devices table with allowed=true entries), require device_id to match
+    const allowRes = await client.query('SELECT 1 FROM devices WHERE allowed = true LIMIT 1');
+    if (allowRes.rowCount > 0) {
+      if (!device_id) {
+        return res.status(403).json({ success: false, message: 'Device not allowed (device_id required)' });
       }
+      const ok = (await client.query('SELECT 1 FROM devices WHERE device_id = $1 AND allowed = true LIMIT 1', [device_id])).rowCount > 0;
+      if (!ok) return res.status(403).json({ success: false, message: 'Device not allowed' });
     }
 
-    const r = await pool.query('SELECT id, username, role, pin FROM users WHERE username = $1 LIMIT 1', [username]);
-    if (r.rowCount === 0) return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    const user = r.rows[0];
-    if (!user.pin || String(user.pin) !== String(pin)) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    // Find user by PIN (simple plain-text match per your current design)
+    const userRes = await client.query('SELECT id, username, role, pin FROM users WHERE pin = $1 LIMIT 1', [String(pin)]);
+    if (userRes.rowCount === 0) {
+      return res.status(401).json({ success: false, message: 'Invalid PIN' });
+    }
 
+    const user = userRes.rows[0];
+    // Return basic user info for the client to navigate
     return res.json({ success: true, id: user.id, username: user.username, role: user.role });
   } catch (err) {
     console.error('/login-pin error', err);
     return res.status(500).json({ success: false, message: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 
