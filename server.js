@@ -1825,6 +1825,52 @@ app.delete('/purchase-orders/:id', async (req, res) => {
   }
 });
 
+// ✅ Create purchase order
+app.post('/purchase-orders', async (req, res) => {
+  const { supplier_id = null, items = [] } = req.body || {};
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, message: 'Items required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // calculate total (sum qty * unit_cost) safely
+    const total = items.reduce((sum, it) => sum + (Number(it.qty || 0) * Number(it.unit_cost || 0)), 0);
+
+    const poInsert = await client.query(
+      `INSERT INTO purchase_orders (supplier_id, status, total, created_at)
+       VALUES ($1, $2, $3, NOW()) RETURNING id`,
+      [supplier_id, 'placed', total]
+    );
+    const poId = poInsert.rows[0].id;
+
+    const insertItemText =
+      `INSERT INTO purchase_order_items (po_id, ingredient_id, qty, unit, unit_cost, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())`;
+
+    for (const it of items) {
+      await client.query(insertItemText, [
+        poId,
+        Number(it.ingredient_id),
+        Number(it.qty || 0),
+        it.unit ?? null,
+        Number(it.unit_cost || 0),
+      ]);
+    }
+
+    await client.query('COMMIT');
+    return res.status(201).json({ success: true, id: poId });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('/purchase-orders POST error', err);
+    return res.status(500).json({ success: false, message: 'Server error', error: String(err?.message ?? err) });
+   } finally {
+    client.release();
+  }
+});
+
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
