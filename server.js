@@ -1671,7 +1671,8 @@ app.put('/purchase-orders/:id/receive', async (req, res) => {
     }
 
     // mark PO received
-    await client.query('UPDATE purchase_orders SET status = $1, updated_at = NOW() WHERE id = $2', ['received', id]);
+    // updated_at column may not exist in your schema — update only status to avoid SQL error
+    await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2', ['received', id]);
 
     await client.query('COMMIT');
     return res.json({ success: true, message: 'PO received', id });
