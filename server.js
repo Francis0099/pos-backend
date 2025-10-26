@@ -1790,6 +1790,41 @@ app.get('/purchase-orders/:id', async (req, res) => {
   }
 });
 
+// Delete a purchase order (only allowed when not received)
+app.delete('/purchase-orders/:id', async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // ensure PO exists
+    const poRes = await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
+    if (poRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Purchase order not found' });
+    }
+    const po = poRes.rows[0];
+    if (po.status === 'received') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Cannot delete a received purchase order' });
+    }
+
+    // delete items (schema uses po_id)
+    await client.query('DELETE FROM purchase_order_items WHERE po_id = $1', [id]);
+    // delete the purchase order
+    await client.query('DELETE FROM purchase_orders WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+    return res.json({ success: true, message: 'Purchase order deleted', id });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('delete PO error', err);
+    return res.status(500).json({ success: false, message: 'Server error', error: String(err.message) });
+  } finally {
+    client.release();
+  }
+});
+
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
