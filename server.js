@@ -1935,7 +1935,116 @@ app.post('/auth/request-otp', (req, res) => {
   });
 });
 
+app.post("/set-pin", async (req, res) => {
+  try {
+    const { username, pin } = req.body || {};
+    if (!username || !pin) return res.status(400).json({ success: false, message: "username and pin required" });
+    if (!/^\d{4,6}$/.test(String(pin))) return res.status(400).json({ success: false, message: "PIN must be 4-6 digits" });
+    const result = await pool.query("UPDATE users SET pin = $1 WHERE username = $2 RETURNING id, username", [String(pin), String(username)]);
+    if (!result.rows || result.rows.length === 0) return res.status(404).json({ success: false, message: "User not found" });
+    return res.json({ success: true, message: "PIN set" });
+  } catch (err) {
+    console.error("/set-pin error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+app.post('/purchase-orders/:id/receive-with-admin', async (req, res) => {
+  const { id } = req.params;
+  const { admin_password, admin_pin } = req.body || {};
+  try {
+    const admin = await authenticateAdmin({ admin_password, admin_pin });
+    if (!admin) return res.status(401).json({ success: false, message: 'Unauthorized' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const poRes = await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
+      if (poRes.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Purchase order not found' }); }
+      if (poRes.rows[0].status === 'received') { await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: 'Purchase order already received' }); }
+
+      const itemsRes = await client.query('SELECT * FROM purchase_order_items WHERE po_id = $1', [id]);
+      for (const it of (itemsRes.rows || [])) {
+        const qty = Number(it.qty || 0);
+        if (qty === 0) continue;
+        await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [qty, it.ingredient_id]);
+        await client.query(`INSERT INTO ingredient_additions (ingredient_id, amount, date, source) VALUES ($1, $2, NOW(), $3)`, [it.ingredient_id, qty, `PO:${id}`]);
+      }
+
+      await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2', ['received', id]);
+      await client.query('COMMIT');
+      return res.json({ success: true, message: 'PO received', id, processedBy: admin.username });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(()=>{});
+      console.error('receive-with-admin error', err && (err.stack || err));
+      return res.status(500).json({ success: false, message: 'Server error', error: String(err?.message || err) });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('/purchase-orders/:id/receive-with-admin error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+
+app.post("/login-pin", async (req, res) => {
+  try {
+    const { pin } = req.body || {};
+    if (!pin) return res.status(400).json({ success: false, message: "PIN required" });
+    const q = await pool.query("SELECT id, username, role FROM users WHERE COALESCE(pin,'') = $1 LIMIT 1", [String(pin)]);
+    if (!q.rows || q.rows.length === 0) return res.status(401).json({ success: false, message: "Invalid PIN" });
+    return res.json({ success: true, id: q.rows[0].id, username: q.rows[0].username, role: q.rows[0].role });
+  } catch (err) {
+    console.error("/login-pin error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 // Start HTTP server (ensure this is present once at the end of the file)
+
+
+// optional simple request logger to diagnose 404s
+app.use((req, _res, next) => {
+  console.log(`REQ ${req.method} ${req.path}`);
+  next();
+});
+
+// authenticateAdmin helper (checks admin password or PIN)
+async function authenticateAdmin({ admin_password, admin_pin } = {}) {
+  try {
+    const q = await pool.query(
+      "SELECT id, username, password, COALESCE(pin,'') AS pin, role FROM users WHERE role IN ('admin','superadmin')"
+    );
+    if (!q.rows || q.rows.length === 0) return null;
+
+    for (const u of q.rows) {
+      // PIN match (exact)
+      if (admin_pin && String(u.pin || "") === String(admin_pin)) {
+        return { id: u.id, username: u.username, role: u.role };
+      }
+
+      // password (bcrypt or plain)
+      if (admin_password && typeof u.password === "string") {
+        try {
+          if (u.password.startsWith("$2")) {
+            if (bcrypt.compareSync(admin_password, u.password)) return { id: u.id, username: u.username, role: u.role };
+          } else {
+            if (admin_password === u.password) return { id: u.id, username: u.username, role: u.role };
+          }
+        } catch (e) {
+          /* ignore and continue */
+        }
+      }
+    }
+    return null;
+  } catch (err) {
+    console.error('authenticateAdmin error:', err && (err.stack || err));
+    return null;
+  }
+}
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
   console.log('Provider availability:', {
@@ -1944,4 +2053,3 @@ app.listen(PORT, "0.0.0.0", () => {
     admin_key: !!process.env.ADMIN_KEY
   });
 });
-
