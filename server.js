@@ -495,9 +495,6 @@ function convertInventoryToProductUnits(inventoryAmount, inventoryUnit, productU
   // otherwise conversion not possible
   return NaN;
 }
-// ---------------------- end helper ----------------------
-
-
 app.post("/add-product", async (req, res) => {
   const { name, category, price, sku, photo, color, ingredients } = req.body;
 
