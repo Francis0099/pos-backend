@@ -1,4 +1,33 @@
 require('dotenv').config();
+
+// normalize env strings (remove trailing spaces) and canonicalize SMTP_SECURE
+Object.keys(process.env).forEach(k => {
+  if (typeof process.env[k] === 'string') process.env[k] = process.env[k].trim();
+});
+process.env.SMTP_SECURE = String(process.env.SMTP_SECURE || 'false').toLowerCase();
+
+// --- ADDED: global error handlers + lightweight startup diagnostics (safe) ---
+process.on('uncaughtException', (err) => {
+  console.error('FATAL: uncaughtException:', err && (err.stack || err));
+  // give logs a moment to flush then exit
+  setTimeout(() => process.exit(1), 1000);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('FATAL: unhandledRejection:', reason && (reason.stack || reason));
+  setTimeout(() => process.exit(1), 1000);
+});
+
+
+// Lightweight module presence checks (do not require optional modules)
+try {
+  try { require.resolve('twilio'); console.log('module: twilio installed'); }
+  catch (e) { console.log('module: twilio NOT installed'); }
+  try { require.resolve('nodemailer'); console.log('module: nodemailer installed'); }
+  catch (e) { console.log('module: nodemailer NOT installed'); }
+} catch (e) {
+  console.error('Startup module checks failed:', e && (e.stack || e));
+}
+
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -194,7 +223,6 @@ app.post("/login", async (req, res) => {
     return res.status(500).json({ success: false, message: "Database error", error: err.message, detail: err.stack?.split("\n")[0] });
   }
 });
-
 
 
 
@@ -1834,10 +1862,21 @@ app.post('/purchase-orders', async (req, res) => {
   const { supplier_id = null, items = [] } = req.body || {};
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, message: 'Items required' });
-  }
-
-  const client = await pool.connect();
+ }
   try {
+    // --- ADDED: basic input validation ---
+    for (const it of items) {
+      const qty = Number(it.qty);
+      const cost = Number(it.unit_cost);
+      if (!Number.isFinite(qty) || qty <= 0) {
+        return res.status(400).json({ success: false, message: 'Invalid item quantity' });
+      }
+      if (!Number.isFinite(cost) || cost < 0) {
+        return res.status(400).json({ success: false, message: 'Invalid item cost' });
+      }
+    }
+
+    const client = await pool.connect();
     await client.query('BEGIN');
 
     // calculate total (sum qty * unit_cost) safely
@@ -1875,373 +1914,37 @@ app.post('/purchase-orders', async (req, res) => {
   }
 });
 
-// --- simplified PIN auth (revert to a basic "type 1" PIN flow) ---
-// Note: this stores/checks a plain text PIN in users.pin for simplicity.
-// It's easier for the client but less secure — consider hashing later.
-app.post('/set-pin', async (req, res) => {
-  const { username, pin } = req.body || {};
-  if (!username || !pin) return res.status(400).json({ success: false, message: 'username and pin required' });
-
-  try {
-    // ensure users table has `pin` column. If not present, run:
-    // ALTER TABLE users ADD COLUMN pin text;
-    const update = await pool.query('UPDATE users SET pin = $1 WHERE username = $2 RETURNING id, username, role', [String(pin), username]);
-    if (update.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-    return res.json({ success: true, message: 'PIN set' , user: update.rows[0]});
-  } catch (err) {
-    console.error('/set-pin error', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-// Login with simple PIN
-app.post('/login-pin', async (req, res) => {
-  const { pin, device_id } = req.body || {};
-  if (!pin) return res.status(400).json({ success: false, message: 'pin required' });
-
-  const client = await pool.connect();
-  try {
-    // If a device allowlist exists (devices table with allowed=true entries), require device_id to match
-    const allowRes = await client.query('SELECT 1 FROM devices WHERE allowed = true LIMIT 1');
-    if (allowRes.rowCount > 0) {
-      if (!device_id) {
-        return res.status(403).json({ success: false, message: 'Device not allowed (device_id required)' });
-      }
-      const ok = (await client.query('SELECT 1 FROM devices WHERE device_id = $1 AND allowed = true LIMIT 1', [device_id])).rowCount > 0;
-      if (!ok) return res.status(403).json({ success: false, message: 'Device not allowed' });
-    }
-
-    // Find user by PIN (simple plain-text match per your current design)
-    const userRes = await client.query('SELECT id, username, role, pin FROM users WHERE pin = $1 LIMIT 1', [String(pin)]);
-    if (userRes.rowCount === 0) {
-      return res.status(401).json({ success: false, message: 'Invalid PIN' });
-    }
-
-    const user = userRes.rows[0];
-    // Return basic user info for the client to navigate
-    return res.json({ success: true, id: user.id, username: user.username, role: user.role });
-  } catch (err) {
-    console.error('/login-pin error', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  } finally {
-    client.release();
-  }
-});
-
-// --- device allowlist management (admin only recommended) ---
-app.post('/devices', async (req, res) => {
-  const { device_id, description, allowed = true } = req.body || {};
-  if (!device_id) return res.status(400).json({ success: false, message: 'device_id required' });
-  try {
-    const r = await pool.query(
-      `INSERT INTO devices (device_id, description, allowed, created_at)
-       VALUES ($1, $2, $3, NOW()) RETURNING id, device_id, description, allowed`,
-      [device_id, description || null, allowed]
-    );
-    return res.status(201).json({ success: true, device: r.rows[0] });
-  } catch (err) {
-    console.error('/devices POST', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-app.get('/devices', async (_req, res) => {
-  try {
-    const r = await pool.query('SELECT id, device_id, description, allowed, created_at FROM devices ORDER BY created_at DESC');
-    return res.json(r.rows || []);
-  } catch (err) {
-    console.error('/devices GET', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-app.delete('/devices/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-    await pool.query('DELETE FROM devices WHERE id = $1', [id]);
-    return res.json({ success: true, id });
-  } catch (err) {
-    console.error('/devices DELETE', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-// ----------------- OTP helpers and endpoints -----------------
+// --- DISABLE OTP: do not initialize providers (safe) ---
 let twilioClient = null;
-if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-  try { twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); } catch(e){ twilioClient = null; }
-}
+let mailer = null;
+console.log('OTP functionality disabled: twilio and smtp not initialized.')
 
-const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 5 * 60 * 1000); // default 5 min
-
-async function sendOtpViaSms(phone, code) {
-  if (!twilioClient) throw new Error('Twilio not configured');
-  // TWILIO_FROM must be set
-  return twilioClient.messages.create({ body: `Your OTP: ${code}`, from: process.env.TWILIO_FROM, to: phone });
-}
-
-async function sendOtpViaEmail(email, code) {
-  // require nodemailer lazily so server won't crash when package isn't installed
-  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) throw new Error('SMTP not configured');
-  let nodemailer;
-  try {
-    nodemailer = require('nodemailer');
-  } catch (err) {
-    throw new Error('nodemailer module not installed. Run: npm install nodemailer');
-  }
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST || 'smtp.gmail.com',
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: String(process.env.SMTP_SECURE || 'false') === 'true',
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+// --- DISABLE OTP ROUTES ---
+// reply immediately that OTP is disabled instead of trying to send
+app.post('/admin/send-test-otp', (req, res) => {
+  return res.status(410).json({
+    ok: false,
+    error: 'otp_disabled',
+    message: 'OTP functionality has been disabled by admin. Use admin credentials/pin flows instead.'
   });
-  return transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: email,
-    subject: 'Your OTP code',
-    text: `Your OTP code is: ${code}. It expires in ${Math.round(OTP_TTL_MS/60000)} minutes.`,
+});
+
+// If you had other OTP endpoints, disable them too (example)
+app.post('/auth/request-otp', (req, res) => {
+  return res.status(410).json({
+    ok: false,
+    error: 'otp_disabled',
+    message: 'OTP functionality has been disabled by admin.'
   });
-}
-
-async function storeOtp(client, identifier, code, ttlMs = OTP_TTL_MS) {
-  const expiresAt = new Date(Date.now() + ttlMs);
-  const q = await client.query(
-    `INSERT INTO otps (identifier, code, expires_at, used, created_at)
-     VALUES ($1, $2, $3, false, NOW()) RETURNING id`,
-    [identifier, String(code), expiresAt]
-  );
-  return q.rows[0];
-}
-
-/*
-DB: create otps table (run once)
-CREATE TABLE IF NOT EXISTS otps (
-  id serial PRIMARY KEY,
-  identifier text NOT NULL,
-  code text NOT NULL,
-  expires_at timestamptz NOT NULL,
-  used boolean DEFAULT false,
-  created_at timestamptz DEFAULT NOW()
-);
-*/
-
-// Request OTP (identifier: phone or email). provider auto chosen by format/env.
-app.post('/auth/request-otp', async (req, res) => {
-  const { identifier } = req.body || {};
-  if (!identifier) return res.status(400).json({ success: false, message: 'identifier required (phone or email)' });
-
-  const client = await pool.connect();
-  try {
-    // generate 6-digit code
-    const code = (Math.floor(100000 + Math.random() * 900000)).toString();
-
-    // store code
-    await storeOtp(client, identifier, code);
-
-    // send via appropriate channel: simple detection by @ for email
-    if (String(identifier).includes('@')) {
-      await sendOtpViaEmail(identifier, code);
-    } else {
-      if (!twilioClient) {
-        console.warn('Twilio not configured, cannot SMS OTP');
-        // still return success but warn client
-        return res.status(500).json({ success: false, message: 'SMS provider not configured' });
-      }
-      await sendOtpViaSms(identifier, code);
-    }
-
-    return res.json({ success: true, message: 'OTP sent' });
-  } catch (err) {
-    console.error('/auth/request-otp error', err);
-    return res.status(500).json({ success: false, message: 'Failed to send OTP', error: String(err.message || err) });
-  } finally {
-    client.release();
-  }
 });
 
-// Receive PO with OTP verification and update stock + recalc total
-// POST /purchase-orders/:id/receive-with-otp { identifier, code }
-app.post('/purchase-orders/:id/receive-with-otp', async (req, res) => {
-  const { id } = req.params;
-  const { identifier, code } = req.body || {};
-  if (!identifier || !code) return res.status(400).json({ success: false, message: 'identifier and code required' });
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // verify OTP: most recent for identifier
-    const otpRes = await client.query(
-      `SELECT id, code, expires_at, used FROM otps WHERE identifier = $1 ORDER BY created_at DESC LIMIT 1`,
-      [identifier]
-    );
-    const otpRow = otpRes.rows[0];
-    if (!otpRow) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-    }
-    if (otpRow.used) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'OTP already used' });
-    }
-    if (String(otpRow.code) !== String(code) || new Date(otpRow.expires_at) < new Date()) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-    }
-
-    // mark OTP used
-    await client.query('UPDATE otps SET used = true WHERE id = $1', [otpRow.id]);
-
-    // lock PO
-    const poRes = await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
-    if (poRes.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ success: false, message: 'Purchase order not found' });
-    }
-    const po = poRes.rows[0];
-    if (po.status === 'received') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'Purchase order already received' });
-    }
-
-    // compute total from items (qty * unit_cost)
-    const sumRes = await client.query(`SELECT COALESCE(SUM(COALESCE(qty::numeric,0) * COALESCE(unit_cost::numeric,0)),0) AS total FROM purchase_order_items WHERE po_id = $1`, [id]);
-    const computedTotal = Number(sumRes.rows[0]?.total ?? 0);
-
-    // update purchase_orders total and status
-    await client.query('UPDATE purchase_orders SET total = $1, status = $2 WHERE id = $3', [computedTotal, 'received', id]);
-
-    // update stock and insert additions
-    const itemsRes = await client.query('SELECT ingredient_id, qty FROM purchase_order_items WHERE po_id = $1', [id]);
-    for (const it of itemsRes.rows) {
-      const qty = Number(it.qty || 0);
-      if (qty > 0) {
-        await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [qty, it.ingredient_id]);
-        await client.query(
-          `INSERT INTO ingredient_additions (ingredient_id, amount, date, source)
-           VALUES ($1, $2, NOW(), $3)`,
-          [it.ingredient_id, qty, `PO:${id}`]
-        );
-      }
-    }
-
-    await client.query('COMMIT');
-    return res.json({ success: true, message: 'PO received', id: Number(id), total: computedTotal });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(()=>{});
-    console.error('❌ receive-with-otp error:', err && (err.message || err));
-    return res.status(500).json({ success: false, message: 'Server error', error: String(err && err.message || err) });
-  } finally {
-    client.release();
-  }
-});
-
-// simple admin auth using an env secret (safe for small internal admin UI)
-function adminAuth(req, res, next) {
-  const key = req.headers['x-admin-key'] || req.body?.admin_key || req.query?.admin_key;
-  if (!process.env.ADMIN_KEY) return res.status(500).json({ success: false, message: 'ADMIN_KEY not configured' });
-  if (!key || String(key) !== String(process.env.ADMIN_KEY)) return res.status(403).json({ success: false, message: 'Forbidden' });
-  next();
-}
-
-// helper: store OTP row
-async function storeOtpRow(client, identifier, code, ttlMs = Number(process.env.OTP_TTL_MS || 300000)) {
-  const expiresAt = new Date(Date.now() + ttlMs);
-  const q = await client.query(
-    `INSERT INTO otps (identifier, code, expires_at, used, created_at)
-     VALUES ($1, $2, $3, false, NOW()) RETURNING id`,
-    [identifier, String(code), expiresAt]
-  );
-  return q.rows[0];
-}
-
-// admin: register/update device (creates or updates by device_id)
-app.post('/admin/devices', adminAuth, async (req, res) => {
-  const { device_id, description = null, allowed = true } = req.body || {};
-  if (!device_id) return res.status(400).json({ success: false, message: 'device_id required' });
-
-  try {
-    // upsert on device_id
-    const q = await pool.query(
-      `INSERT INTO devices (device_id, description, allowed, created_at)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (device_id) DO UPDATE
-         SET description = EXCLUDED.description, allowed = EXCLUDED.allowed
-       RETURNING id, device_id, description, allowed, created_at`,
-      [device_id, description, allowed]
-    );
-    return res.status(201).json({ success: true, device: q.rows[0] });
-  } catch (err) {
-    console.error('/admin/devices error', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-// admin: list devices
-app.get('/admin/devices', adminAuth, async (req, res) => {
-  try {
-    const q = await pool.query('SELECT id, device_id, description, allowed, created_at FROM devices ORDER BY created_at DESC');
-    return res.json({ success: true, devices: q.rows });
-  } catch (err) {
-    console.error('/admin/devices GET error', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-// admin: send a test OTP to an identifier (phone or email)
-// body: { identifier: "alice@example.com" } or { identifier: "+15551234567" }
-app.post('/admin/send-test-otp', adminAuth, async (req, res) => {
-  const { identifier } = req.body || {};
-  if (!identifier) return res.status(400).json({ success: false, message: 'identifier required' });
-
-  const client = await pool.connect();
-  try {
-    // generate 6-digit code
-    const code = (Math.floor(100000 + Math.random() * 900000)).toString();
-
-    // store OTP row
-    await storeOtpRow(client, identifier, code);
-
-    // send via email or SMS depending on identifier format
-    if (String(identifier).includes('@')) {
-      // email
-      if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-        return res.status(500).json({ success: false, message: 'SMTP not configured' });
-      }
-      const nodemailer = require('nodemailer');
-      const transporter = nodemailer.createTransport({
-        host: process.env.SMTP_HOST || 'smtp.gmail.com',
-        port: Number(process.env.SMTP_PORT || 587),
-        secure: String(process.env.SMTP_SECURE || 'false') === 'true',
-        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-      });
-      await transporter.sendMail({
-        from: process.env.SMTP_FROM || process.env.SMTP_USER,
-        to: identifier,
-        subject: 'Test OTP',
-        text: `Your test OTP is: ${code} (expires in ${Math.round((Number(process.env.OTP_TTL_MS||300000)/60000))} minutes)`,
-      });
-      return res.json({ success: true, method: 'email', message: 'OTP sent by email' });
-    } else {
-      // SMS
-      if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_FROM) {
-        return res.status(500).json({ success: false, message: 'Twilio not configured' });
-      }
-      const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-      await twilio.messages.create({
-        body: `Your test OTP is: ${code}`,
-        from: process.env.TWILIO_FROM,
-        to: identifier,
-      });
-      return res.json({ success: true, method: 'sms', message: 'OTP sent by SMS' });
-    }
-  } catch (err) {
-    console.error('/admin/send-test-otp error', err);
-    return res.status(500).json({ success: false, message: 'Failed to send OTP', error: String(err?.message || err) });
-  } finally {
-    client.release();
-  }
+// Start HTTP server (ensure this is present once at the end of the file)
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
+  console.log('Provider availability:', {
+    twilio: !!twilioClient,
+    smtp: !!(process.env.SMTP_USER && process.env.SMTP_PASS && process.env.SMTP_HOST),
+    admin_key: !!process.env.ADMIN_KEY
+  });
 });
 
