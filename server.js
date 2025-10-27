@@ -1954,7 +1954,7 @@ app.post('/purchase-orders/:id/receive-with-admin', async (req, res) => {
   const { admin_password, admin_pin } = req.body || {};
   try {
     const admin = await authenticateAdmin({ admin_password, admin_pin });
-    if (!admin) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    if (!admin) return res.status(401).json({ success: false, message: 'Unauthorized: admin password and PIN required and must match the same admin' });
 
     const client = await pool.connect();
     try {
@@ -2011,30 +2011,30 @@ app.use((req, _res, next) => {
   next();
 });
 
-// authenticateAdmin helper (checks admin password or PIN)
+// authenticateAdmin helper (checks admin password AND PIN must match same user)
 async function authenticateAdmin({ admin_password, admin_pin } = {}) {
   try {
+    if (!admin_password || !admin_pin) return null; // require both
+
     const q = await pool.query(
       "SELECT id, username, password, COALESCE(pin,'') AS pin, role FROM users WHERE role IN ('admin','superadmin')"
     );
     if (!q.rows || q.rows.length === 0) return null;
 
     for (const u of q.rows) {
-      // PIN match (exact)
-      if (admin_pin && String(u.pin || "") === String(admin_pin)) {
-        return { id: u.id, username: u.username, role: u.role };
-      }
-
-      // password (bcrypt or plain)
-      if (admin_password && typeof u.password === "string") {
-        try {
-          if (u.password.startsWith("$2")) {
-            if (bcrypt.compareSync(admin_password, u.password)) return { id: u.id, username: u.username, role: u.role };
-          } else {
-            if (admin_password === u.password) return { id: u.id, username: u.username, role: u.role };
+      // require both pin AND password for same user
+      if (String(u.pin || "") === String(admin_pin)) {
+        // verify password (bcrypt or plain)
+        if (typeof u.password === "string") {
+          try {
+            if (u.password.startsWith("$2")) {
+              if (bcrypt.compareSync(admin_password, u.password)) return { id: u.id, username: u.username, role: u.role };
+            } else {
+              if (admin_password === u.password) return { id: u.id, username: u.username, role: u.role };
+            }
+          } catch (e) {
+            // continue
           }
-        } catch (e) {
-          /* ignore and continue */
         }
       }
     }
