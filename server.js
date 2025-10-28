@@ -1636,6 +1636,18 @@ app.get('/products-split-stock', async (req, res) => {
   }
 });
 
+/* REPLACE: Simple /best-sellers handler (first occurrence) -> 410 (use improved handler later) */
+app.get("/best-sellers", async (req, res) => {
+  // Legacy simple handler removed. Use the improved /best-sellers endpoint (includes product.photo).
+  res.status(410).json({ success: false, message: "Legacy endpoint removed. Use /best-sellers (updated) endpoint." });
+});
+
+/* REPLACE: Simple /sales-report handler (first occurrence) -> 410 (use improved handler later) */
+app.get("/sales-report", async (req, res) => {
+  // Legacy simple handler removed. Use the improved /sales-report endpoint defined later.
+  res.status(410).json({ success: false, message: "Legacy endpoint removed. Use /sales-report (updated) endpoint." });
+});
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
   console.log('Provider availability:', {
