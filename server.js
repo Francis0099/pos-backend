@@ -353,6 +353,52 @@ app.post('/submit-order', async (req, res) => {
   }
 });
 
+// compute product stock using unit-aware conversions (returns integer)
+async function computeProductStock(productId, clientOrPool = pool) {
+  const q = await clientOrPool.query(
+    `SELECT
+       pi.amount_needed,
+       pi.amount_unit,
+       i.stock AS ingredient_stock,
+       i.unit AS ingredient_unit,
+       i.piece_amount,
+       i.piece_unit
+     FROM product_ingredients pi
+     JOIN ingredients i ON pi.ingredient_id = i.id
+     WHERE pi.product_id = $1`,
+    [productId]
+  );
+
+  const rows = q.rows || [];
+  if (rows.length === 0) return 0;
+
+  const counts = [];
+  for (const r of rows) {
+    const prodAmount = Number(r.amount_needed || 0);
+    if (!Number.isFinite(prodAmount) || prodAmount <= 0) {
+      counts.push(0);
+      continue;
+    }
+    const prodUnit = r.amount_unit || r.ingredient_unit;
+    const invAmt = Number(r.ingredient_stock ?? 0);
+    const invUnit = r.ingredient_unit;
+
+    const invInProdUnits = convertInventoryToProductUnits(invAmt, invUnit, prodUnit, {
+      piece_amount: r.piece_amount,
+      piece_unit: r.piece_unit,
+    });
+
+    if (!Number.isFinite(invInProdUnits)) {
+      counts.push(0);
+    } else {
+      const availableCount = Math.floor(invInProdUnits / prodAmount);
+      counts.push(Number.isFinite(availableCount) ? Math.max(0, availableCount) : 0);
+    }
+  }
+
+  return counts.length > 0 ? Math.min(...counts) : 0;
+}
+
 // ---------------------- small unit conversion helpers (insert after dbQuery) ----------------------
 function normUnit(u) {
   if (!u) return "";
@@ -585,6 +631,15 @@ app.post("/add-product", async (req, res) => {
       }
     }
 
+    // --- NEW: compute and persist product.stock so UI shows correct available count ---
+    try {
+      const computedStock = await computeProductStock(productId, client);
+      await client.query('UPDATE products SET stock = $1 WHERE id = $2', [computedStock, productId]);
+    } catch (e) {
+      // non-fatal: log but continue (stock will still be computed dynamically by endpoints)
+      console.error('computeProductStock error for new product', productId, e && e.stack || e);
+    }
+
     await client.query("COMMIT");
     return res.json({
       success: true,
@@ -804,6 +859,14 @@ app.put("/products/:id/ingredients", async (req, res) => {
       `;
 
       await client.query(sql, values);
+    }
+
+    // --- NEW: recompute product stock for this product and persist ---
+    try {
+      const computedStock = await computeProductStock(id, client);
+      await client.query('UPDATE products SET stock = $1 WHERE id = $2', [computedStock, id]);
+    } catch (e) {
+      console.error('computeProductStock error for product', id, e && e.stack || e);
     }
 
     await client.query("COMMIT");
@@ -1827,6 +1890,7 @@ app.delete('/purchase-orders/:id', async (req, res) => {
     await client.query('BEGIN');
 
     // ensure PO exists
+
     const poRes = await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
     if (poRes.rowCount === 0) {
       await client.query('ROLLBACK');
