@@ -1865,6 +1865,7 @@ app.get('/purchase-orders', async (req, res) => {
 app.get('/purchase-orders/:id', async (req, res) => {
   const { id } = req.params;
   try {
+      
        const poRes = await pool.query(
       `SELECT id, supplier_id, created_by, status, total, notes, created_at
        FROM purchase_orders WHERE id = $1 LIMIT 1`,
@@ -2125,6 +2126,60 @@ async function authenticateAdmin({ admin_password, admin_pin } = {}) {
     return null;
   }
 }
+
+app.get('/products-split-stock', async (req, res) => {
+  try {
+    // load active products
+    const prodRes = await pool.query(`SELECT id, name, price, category, sku, photo, color, is_active FROM products WHERE (is_active = true OR is_active IS NULL)`);
+    const products = prodRes.rows || [];
+
+    // precompute how many products reference each ingredient
+    const countsRes = await pool.query(`SELECT ingredient_id, COUNT(DISTINCT product_id) AS cnt FROM product_ingredients GROUP BY ingredient_id`);
+    const usingCount = {};
+    for (const r of countsRes.rows) usingCount[r.ingredient_id] = Number(r.cnt || 1);
+
+    const out = [];
+    for (const p of products) {
+      const ingrRes = await pool.query(`
+        SELECT pi.ingredient_id, pi.amount_needed, pi.amount_unit,
+               i.unit AS ingredient_unit, i.stock AS ingredient_stock, i.piece_amount, i.piece_unit
+        FROM product_ingredients pi
+        JOIN ingredients i ON pi.ingredient_id = i.id
+        WHERE pi.product_id = $1
+      `, [p.id]);
+
+      const counts = [];
+      for (const r of (ingrRes.rows || [])) {
+        const prodAmount = Number(r.amount_needed || 0);
+        if (!Number.isFinite(prodAmount) || prodAmount <= 0) { counts.push(0); continue; }
+
+        // divide ingredient stock equally among all products that use it
+        const totalInv = Number(r.ingredient_stock ?? 0);
+        const allocatedInv = totalInv / (usingCount[r.ingredient_id] || 1);
+
+        const invInProdUnits = convertInventoryToProductUnits(allocatedInv, r.ingredient_unit, (r.amount_unit || r.ingredient_unit), {
+          piece_amount: r.piece_amount,
+          piece_unit: r.piece_unit
+        });
+
+        if (!Number.isFinite(invInProdUnits)) counts.push(0);
+        else counts.push(Math.max(0, Math.floor(invInProdUnits / prodAmount)));
+      }
+
+      const available = counts.length > 0 ? Math.min(...counts) : 0;
+      out.push({
+        id: p.id, name: p.name, price: p.price !== null ? Number(p.price) : 0,
+        category: p.category, sku: p.sku, photo: p.photo, color: p.color,
+        is_active: p.is_active, stock: available
+      });
+    }
+
+    return res.json(out);
+  } catch (err) {
+    console.error('❌ /products-split-stock error:', err && (err.message || err));
+    return res.status(500).json({ success: false, message: 'Failed to compute split stock' });
+  }
+});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
