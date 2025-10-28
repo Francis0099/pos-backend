@@ -1270,17 +1270,20 @@ app.get('/users', async (req, res) => {
 });
 
 // Best sellers (subtract refunded quantities)
-app.get("/best-sellers", async (req, res) => {
+app.get('/best-sellers', async (req, res) => {
   try {
-    const { month, year, category } = req.query;
-    const m = month ? Number(month) : new Date().getMonth() + 1;
-    const y = year ? Number(year) : new Date().getFullYear();
+    const { month, year, category, lastMonth } = req.query;
+    let target = new Date();
+    if (String(lastMonth).toLowerCase() === 'true') target.setMonth(target.getMonth() - 1);
+    const m = month ? Number(month) : (target.getMonth() + 1);
+    const y = year ? Number(year) : target.getFullYear();
 
-    const sql = `
+    let sql = `
       SELECT
         p.id,
         p.name,
-        COALESCE(SUM(GREATEST(si.quantity - COALESCE(ri.refunded_qty,0),0)),0)::int AS total_sold
+        p.photo,
+        SUM( GREATEST(si.quantity - COALESCE(ri.refunded_qty,0), 0) )::int AS total_sold
       FROM sale_items si
       JOIN sales s ON s.id = si.sale_id
       JOIN products p ON p.id = si.product_id
@@ -1290,19 +1293,27 @@ app.get("/best-sellers", async (req, res) => {
         JOIN refunds r ON r.id = ri.refund_id
         GROUP BY r.sale_id, ri.product_id
       ) ri ON ri.sale_id = si.sale_id AND ri.product_id = si.product_id
-      WHERE EXTRACT(YEAR FROM s.created_at) = $1
-        AND EXTRACT(MONTH FROM s.created_at) = $2
-      ${category ? "AND p.category = $3" : ""}
-      GROUP BY p.id, p.name
-      ORDER BY total_sold DESC
-      LIMIT 20;
+      WHERE EXTRACT(YEAR FROM s.created_at) = $1 AND EXTRACT(MONTH FROM s.created_at) = $2
     `;
-    const params = category ? [y, m, category] : [y, m];
-    const { rows } = await pool.query(sql, params);
-    res.json({ month: m, year: y, items: rows });
+    const params = [y, m];
+
+    if (category && String(category).trim()) {
+      sql += ` AND p.category = $3`;
+      params.push(String(category).trim());
+    }
+
+    sql += `
+      GROUP BY p.id, p.name, p.photo
+      ORDER BY total_sold DESC
+      LIMIT 20
+    `;
+
+    const result = await pool.query(sql, params);
+    const items = (result.rows || []).map(r => ({ id: r.id, name: r.name, total_sold: Number(r.total_sold||0), photo: r.photo || null }));
+    return res.json({ month: m, year: y, items });
   } catch (err) {
-    console.error("best-sellers error:", err);
-    res.status(500).json({ success: false, message: "Failed to fetch best sellers" });
+    console.error('❌ best-sellers (override) error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Failed to fetch best sellers' });
   }
 });
 
