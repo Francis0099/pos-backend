@@ -202,17 +202,9 @@ app.post("/login", async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ success: false, message: "Missing credentials" });
 
-  console.log("DEBUG /login env:", {
-  DATABASE_URL: process.env.DATABASE_URL,
-  DB_USER: process.env.DB_USER,
-  PGUSER: process.env.PGUSER,
-  USER: process.env.USER
-});
-
-
   try {
     const result = await pool.query(
-      "SELECT id, username, password, role FROM users WHERE username = $1 LIMIT 1",
+      "SELECT id, username, password, role, COALESCE(pin,'') AS pin FROM users WHERE username = $1 LIMIT 1",
       [username]
     );
     if (!result.rows || result.rows.length === 0) return res.json({ success: false, message: "Invalid credentials" });
@@ -229,7 +221,10 @@ app.post("/login", async (req, res) => {
 
     if (!ok) return res.json({ success: false, message: "Invalid credentials" });
 
-    return res.json({ success: true, id: user.id, username: user.username, role: user.role });
+    // do NOT return the PIN value. Return a boolean flag indicating a PIN exists for the account.
+    const has_pin = !!String(user.pin || '').trim();
+
+    return res.json({ success: true, id: user.id, username: user.username, role: user.role, has_pin });
   } catch (err) {
     console.error("❌ Login query error:", err);
     return res.status(500).json({ success: false, message: "Database error", error: err.message, detail: err.stack?.split("\n")[0] });
