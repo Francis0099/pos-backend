@@ -231,7 +231,30 @@ app.post("/login", async (req, res) => {
   }
 });
 
+app.post("/login-pin", async (req, res) => {
+  const { username, pin } = req.body || {};
+  if (!username || !pin) return res.status(400).json({ success: false, message: "Missing username or pin" });
 
+  try {
+    const result = await pool.query(
+      "SELECT id, username, role, COALESCE(pin,'') AS pin FROM users WHERE username = $1 LIMIT 1",
+      [username]
+    );
+    if (!result.rows || result.rows.length === 0) {
+      return res.status(400).json({ success: false, message: "Invalid username or pin" });
+    }
+
+    const user = result.rows[0];
+    if (String(user.pin || "") === String(pin)) {
+      return res.json({ success: true, id: user.id, username: user.username, role: user.role, has_pin: !!String(user.pin).trim() });
+    }
+
+    return res.status(400).json({ success: false, message: "Invalid username or pin" });
+  } catch (err) {
+    console.error("❌ /login-pin error:", err);
+    return res.status(500).json({ success: false, message: "Database error" });
+  }
+});
 
 app.get('/products', async (req, res) => {
   try {
