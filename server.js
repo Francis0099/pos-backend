@@ -287,6 +287,9 @@ app.post('/submit-order', async (req, res) => {
     const saleRes = await client.query(saleInsertSql, [subtotalNet, taxAmount, totalAmount, paymentMode]);
     const saleId = saleRes.rows[0].id;
 
+    // track which products were affected so we can recompute their product.stock
+    const affectedProductIds = new Set();
+
     // insert sale_items and record usages per normalized item (ensures numeric fields)
     for (const it of normalizedItems) {
       const unitPrice = Number(it.unit_price ?? 0);
@@ -294,6 +297,9 @@ app.post('/submit-order', async (req, res) => {
         "INSERT INTO sale_items (product_id, quantity, unit_price, sale_id) VALUES ($1, $2, $3, $4)",
         [it.id, it.quantity, unitPrice, saleId]
       );
+
+      // mark product as affected
+      affectedProductIds.add(it.id);
 
       // fetch product ingredients and ingredient inventory metadata
       const ingrSql = `
@@ -328,6 +334,17 @@ app.post('/submit-order', async (req, res) => {
           [saleId, it.id, r.ingredient_id, amountUsed]
         );
       }
+    }
+
+    // recompute & persist product.stock for affected products (transactional)
+    try {
+      for (const pid of affectedProductIds) {
+        const newStock = await computeProductStock(pid, client);
+        await client.query('UPDATE products SET stock = $1 WHERE id = $2', [newStock, pid]);
+      }
+    } catch (e) {
+      console.error('Failed to recompute product.stock after sale', e && (e.stack || e));
+      // non-fatal: continue commit — product.stock can be recalculated later by endpoints
     }
 
     await client.query("COMMIT");
@@ -1848,7 +1865,7 @@ app.get('/purchase-orders', async (req, res) => {
 app.get('/purchase-orders/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    const poRes = await pool.query(
+       const poRes = await pool.query(
       `SELECT id, supplier_id, created_by, status, total, notes, created_at
        FROM purchase_orders WHERE id = $1 LIMIT 1`,
       [id]
