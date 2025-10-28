@@ -70,6 +70,18 @@ pool.on("error", (err) => {
   console.error("POSTGRES POOL ERROR:", err && err.stack ? err.stack : err);
 });
 
+// --- ensure optional globals exist to avoid ReferenceError in startup logs ---
+let twilioClient = null;
+let smtpTransport = null;
+
+// --- TEST: force an error on startup ---
+if (String(process.env.TEST_ERROR).toLowerCase() === 'true') {
+  console.log('⚠️  TEST ERROR forced on startup');
+  setTimeout(() => {
+    throw new Error('TEST ERROR: forced crash');
+  }, 1000);
+}
+
 async function dbQuery(text, params = []) {
   try {
     const result = await pool.query(text, params);
@@ -708,13 +720,13 @@ app.delete("/products/:id", async (req, res) => {
   }
 });
 
-
+// --- GET /products/:id (include photo in response) ---
 app.get("/products/:id", async (req, res) => {
   const { id } = req.params;
 
   try {
     const result = await pool.query(
-      "SELECT id, name, category, price, sku, is_active FROM products WHERE id = $1 LIMIT 1",
+      "SELECT id, name, category, price, sku, is_active, photo FROM products WHERE id = $1 LIMIT 1",
       [id]
     );
 
@@ -730,6 +742,7 @@ app.get("/products/:id", async (req, res) => {
       price: Number(row.price ?? 0),
       sku: row.sku,
       is_active: row.is_active,
+      photo: row.photo || null, // return photo
     });
   } catch (err) {
     console.error("❌ Error fetching product details:", err.message);
@@ -737,10 +750,10 @@ app.get("/products/:id", async (req, res) => {
   }
 });
 
-// ✅ Update product basic fields (name, category, price)
+// --- PUT /products/:id (update) ---
 app.put("/products/:id", async (req, res) => {
   const { id } = req.params;
-  const { name, category, price } = req.body;
+  const { name, category, price, photo } = req.body; // <-- accept photo
 
   if (!name || !category || price === undefined || price === null) {
     return res.status(400).json({ success: false, message: "Missing required fields" });
@@ -754,8 +767,8 @@ app.put("/products/:id", async (req, res) => {
 
   try {
     const result = await pool.query(
-      "UPDATE products SET name = $1, category = $2, price = $3 WHERE id = $4",
-      [normalizedName, category, numericPrice, id]
+      "UPDATE products SET name = $1, category = $2, price = $3, photo = COALESCE($4, photo) WHERE id = $5",
+      [normalizedName, category, numericPrice, photo ?? null, id] // persist photo when provided
     );
 
     if (result.rowCount === 0) {
@@ -1477,6 +1490,7 @@ app.get('/ingredients/:id/additions', async (req, res) => {
   }
 });
 
+// --- Best-sellers: include product photo in SELECT/response ---
 app.get('/best-sellers', async (req, res) => {
   try {
     const { month, year, lastMonth, category } = req.query;
@@ -1487,12 +1501,11 @@ app.get('/best-sellers', async (req, res) => {
     const m = month ? Number(month) : (target.getMonth() + 1);
     const y = year ? Number(year) : target.getFullYear();
 
-    // Sum sale_items minus already refunded quantities (refund_items)
-    // refunded_qty is summed per sale + product, then subtracted from sold quantity
     let sql = `
       SELECT
         p.id,
         p.name,
+        p.photo,                         -- <-- include photo
         SUM( GREATEST(si.quantity - COALESCE(ri.refunded_qty,0), 0) )::int AS total_sold
       FROM sale_items si
       JOIN sales s ON s.id = si.sale_id
@@ -1513,7 +1526,7 @@ app.get('/best-sellers', async (req, res) => {
     }
 
     sql += `
-      GROUP BY p.id, p.name
+      GROUP BY p.id, p.name, p.photo
       ORDER BY total_sold DESC
       LIMIT 10
     `;
@@ -1523,564 +1536,6 @@ app.get('/best-sellers', async (req, res) => {
   } catch (err) {
     console.error('❌ best-sellers error:', err && (err.message) || err);
     return res.status(500).json({ success: false, message: 'Failed to fetch best sellers' });
-  }
-});
-
-
-app.get('/dashboard-summary', async (req, res) => {
-  try {
-    // Total sales amount today
-    const salesResult = await pool.query(
-      'SELECT COALESCE(SUM(total_amount), 0) AS total FROM sales WHERE DATE(created_at) = CURRENT_DATE'
-    );
-    const totalSalesToday = Number(salesResult.rows[0]?.total || 0);
-
-    // Low stock products (computed stock <= 5)
-    const lowResult = await pool.query(`
-      SELECT COUNT(*) AS cnt FROM (
-        SELECT p.id,
-               COALESCE(MIN(FLOOR(i.stock / pi.amount_needed)), 0) AS stock
-        FROM products p
-        LEFT JOIN product_ingredients pi ON p.id = pi.product_id
-        LEFT JOIN ingredients i ON pi.ingredient_id = i.id
-        GROUP BY p.id
-      ) t
-      WHERE t.stock <= 5
-    `);
-    const lowStockCount = Number(lowResult.rows[0]?.cnt || 0);
-
-    // Best seller today
-    const bestResult = await pool.query(`
-      SELECT p.id, p.name, SUM(si.quantity) AS total_sold
-      FROM sale_items si
-      JOIN sales s ON s.id = si.sale_id
-      JOIN products p ON p.id = si.product_id
-      WHERE DATE(s.created_at) = CURRENT_DATE
-      GROUP BY p.id, p.name
-      ORDER BY total_sold DESC
-      LIMIT 1
-    `);
-    const bestSeller = bestResult.rows && bestResult.rows.length > 0 ? {
-      id: bestResult.rows[0].id,
-      name: bestResult.rows[0].name,
-      total_sold: Number(bestResult.rows[0].total_sold || 0),
-    } : null;
-
-    return res.json({
-      totalSalesToday,
-      lowStockCount,
-      bestSeller,
-    });
-  } catch (err) {
-    console.error('❌ dashboard-summary error:', err && (err.message) || err);
-    return res.status(500).json({ success: false, message: 'Failed to fetch dashboard summary' });
-  }
-});
-
-
-app.get('/sales-trend', async (req, res) => {
-  const { period, productId } = req.query;
-  try {
-    let where = '';
-    let selectTime = '';
-    let groupBy = '';
-    let orderBy = '';
-    const params = [];
-
-    if (period === 'day') {
-      where = 'WHERE DATE(s.created_at) = CURRENT_DATE';
-      selectTime = 'EXTRACT(HOUR FROM s.created_at) AS bucket';
-      groupBy = 'GROUP BY EXTRACT(HOUR FROM s.created_at)';
-      orderBy = 'ORDER BY EXTRACT(HOUR FROM s.created_at) ASC';
-    } else if (period === 'week') {
-      where = "WHERE s.created_at >= CURRENT_DATE - INTERVAL '6 days'";
-      selectTime = 'DATE(s.created_at) AS bucket';
-      groupBy = 'GROUP BY DATE(s.created_at)';
-      orderBy = 'ORDER BY DATE(s.created_at) ASC';
-    } else {
-      where = "WHERE s.created_at >= CURRENT_DATE - INTERVAL '29 days'";
-      selectTime = 'DATE(s.created_at) AS bucket';
-      groupBy = 'GROUP BY DATE(s.created_at)';
-      orderBy = 'ORDER BY DATE(s.created_at) ASC';
-    }
-
-    let productFilter = '';
-    if (productId) {
-      productFilter = ` AND si.product_id = $1`;
-      params.push(Number(productId));
-    }
-
-    const sql = `
-      SELECT ${selectTime}, SUM(si.quantity) AS total
-      FROM sale_items si
-      JOIN sales s ON si.sale_id = s.id
-      ${where}${productFilter}
-      ${groupBy}
-      ${orderBy}
-    `;
-
-    const result = await pool.query(sql, params);
-
-    const rows = result.rows;
-    const labels = rows.map(r => {
-      if (period === 'day') {
-        const h = String(r.bucket).padStart(2, '0');
-        return `${h}:00`;
-      }
-      const d = new Date(r.bucket);
-      return `${d.getMonth() + 1}/${d.getDate()}`;
-    });
-    const values = rows.map(r => Number(r.total) || 0);
-
-    return res.json({ labels, values });
-  } catch (err) {
-    console.error('❌ sales-trend error:', err && (err.message) || err);
-    return res.status(500).json({ success: false, message: 'Trend fetch failed' });
-  }
-});
-
-
-app.post("/refund-sale", async (req, res) => {
-  const { saleId, items = [], amount = 0, reason = "", restock = true } = req.body || {};
-  if (!saleId) return res.status(400).json({ success: false, message: "saleId required" });
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    // ensure sale exists
-    const saleCheck = await client.query("SELECT id FROM sales WHERE id = $1 LIMIT 1", [saleId]);
-    if (saleCheck.rowCount === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ success: false, message: "Sale not found" });
-    }
-
-    // if items not provided, build from sale_items (full-sale refund)
-    let itemsToRefund = Array.isArray(items) && items.length ? items.map(i => ({ productId: Number(i.productId || i.id), quantity: Number(i.quantity || i.qty || 0) })) : [];
-    if (itemsToRefund.length === 0) {
-      const saleItemsRes = await client.query("SELECT product_id, quantity FROM sale_items WHERE sale_id = $1", [saleId]);
-      itemsToRefund = saleItemsRes.rows.map(r => ({ productId: Number(r.product_id), quantity: Number(r.quantity) }));
-    }
-
-    // validate requested refund quantities against sold minus already refunded
-    for (const it of itemsToRefund) {
-      if (!it.productId || it.quantity <= 0) continue;
-      const soldRes = await client.query(
-        "SELECT SUM(quantity) AS sold FROM sale_items WHERE sale_id = $1 AND product_id = $2",
-        [saleId, it.productId]
-      );
-      const sold = Number(soldRes.rows[0]?.sold ?? 0);
-
-      const refundedRes = await client.query(
-        `SELECT COALESCE(SUM(ri.quantity),0) AS refunded
-         FROM refund_items ri
-         JOIN refunds r ON r.id = ri.refund_id
-         WHERE r.sale_id = $1 AND ri.product_id = $2`,
-        [saleId, it.productId]
-      );
-      const alreadyRefunded = Number(refundedRes.rows[0]?.refunded ?? 0);
-
-      const available = sold - alreadyRefunded;
-      if (it.quantity > available) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          success: false,
-          message: `Refund quantity for product ${it.productId} exceeds available (${available})`,
-        });
-      }
-    }
-
-    // insert refund record
-    const refundRes = await client.query(
-      "INSERT INTO refunds (sale_id, amount, reason) VALUES ($1, $2, $3) RETURNING id, created_at",
-      [saleId, amount, reason]
-    );
-    const refundId = refundRes.rows[0].id;
-
-    // insert refund_items and optionally restore ingredient stock per product
-    for (const it of itemsToRefund) {
-      if (!it.productId || it.quantity <= 0) continue;
-      await client.query(
-        "INSERT INTO refund_items (refund_id, product_id, quantity) VALUES ($1, $2, $3)",
-        [refundId, it.productId, it.quantity]
-      );
-
-      // restore ingredient stock only when restock is truthy
-      if (restock) {
-        const ingrRes = await client.query(
-          `SELECT pi.ingredient_id, pi.amount_needed, pi.amount_unit, i.unit AS ingredient_unit, i.piece_amount, i.piece_unit
-           FROM product_ingredients pi
-           JOIN ingredients i ON pi.ingredient_id = i.id
-           WHERE pi.product_id = $1`,
-          [it.productId]
-        );
-
-        for (const row of ingrRes.rows) {
-          const prodAmount = Number(row.amount_needed);
-          const prodUnit = row.amount_unit || row.ingredient_unit;
-          const invUnit = row.ingredient_unit;
-
-          const perItemInventory = convertToInventoryUnits(prodAmount, prodUnit, invUnit, {
-            piece_amount: row.piece_amount,
-            piece_unit: row.piece_unit,
-          });
-
-          const restore = Number.isFinite(perItemInventory) ? perItemInventory * it.quantity : prodAmount * it.quantity;
-          if (restore > 0) {
-            await client.query(
-              "UPDATE ingredients SET stock = stock + $1::numeric WHERE id = $2",
-              [restore, row.ingredient_id]
-            );
-          }
-        }
-      }
-    }
-
-    await client.query("COMMIT");
-    return res.json({ success: true, refundId, restocked: !!restock });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("❌ /refund-sale error:", err && (err.message || err));
-    return res.status(500).json({ success: false, message: "Refund failed", error: String(err && err.message || err) });
-  } finally {
-    client.release();
-  }
-});
-
-// replace existing app.put('/purchase-orders/:id/receive', ...) handler with this
-app.put('/purchase-orders/:id/receive', async (req, res) => {
-  const { id } = req.params;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // lock PO
-    const poRes = await client.query('SELECT * FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
-    if (poRes.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ success: false, message: 'Purchase order not found' });
-    }
-
-    // load items (schema uses po_id)
-    const itemsRes = await client.query('SELECT * FROM purchase_order_items WHERE po_id = $1', [id]);
-    const items = itemsRes.rows || [];
-
-    // update stock and record additions using your schema: (ingredient_id, amount, date, source)
-    for (const it of items) {
-      const qty = Number(it.qty || 0);
-      // update ingredient stock
-      await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [qty, it.ingredient_id]);
-
-      // insert addition record
-      await client.query(
-        `INSERT INTO ingredient_additions (ingredient_id, amount, date, source)
-         VALUES ($1, $2, NOW(), $3)`,
-        [it.ingredient_id, qty, `PO:${id}`]
-      );
-    }
-
-    // mark PO received
-    // updated_at column may not exist in your schema — update only status to avoid SQL error
-    await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2', ['received', id]);
-
-    await client.query('COMMIT');
-    return res.json({ success: true, message: 'PO received', id });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('receive PO error', err);
-    return res.status(500).json({ success: false, message: 'Server error', error: String(err.message) });
-  } finally {
-    client.release();
-  }
-});
-
-// Cancel a PO
-app.put('/purchase-orders/:id/cancel', async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
-  try {
-    const q = await dbQuery(`UPDATE purchase_orders SET status = 'cancelled' WHERE id = $1 RETURNING id`, [id]);
-    if (!q || q.length === 0) return res.status(404).json({ success: false, message: 'Not found' });
-    return res.json({ success: true });
-  } catch (err) {
-    console.error('cancel po', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-// List purchase orders (basic fields + items)
-app.get('/purchase-orders', async (req, res) => {
-  try {
-    const ordersRes = await pool.query(
-      `SELECT id, supplier_id, created_by, status, total, notes, created_at
-       FROM purchase_orders
-       ORDER BY created_at DESC`
-    );
-    const orders = ordersRes.rows || [];
-
-    // load items for all orders in one query
-    const orderIds = orders.map(o => o.id);
-    let items = [];
-    if (orderIds.length > 0) {
-      const itemsRes = await pool.query(
-        `SELECT poi.*, i.name AS ingredient_name
-         FROM purchase_order_items poi
-         LEFT JOIN ingredients i ON i.id = poi.ingredient_id
-         WHERE poi.po_id = ANY($1::int[])
-         ORDER BY poi.id`,
-        [orderIds]
-      );
-      items = itemsRes.rows || [];
-    }
-
-    // attach items to their orders
-    const byOrder = {};
-    for (const it of items) {
-      const key = String(it.po_id);
-      byOrder[key] = byOrder[key] || [];
-      byOrder[key].push({
-        id: it.id,
-        ingredient_id: it.ingredient_id,
-        ingredient_name: it.ingredient_name,
-        qty: it.qty,
-        unit: it.unit,
-        unit_cost: it.unit_cost,
-        created_at: it.created_at
-      });
-    }
-
-    const out = orders.map(o => ({
-      ...o,
-      items: byOrder[String(o.id)] || []
-    }));
-
-    return res.json(out);
-  } catch (err) {
-    console.error('❌ /purchase-orders error:', err && (err.message || err));
-    return res.status(500).json({ success: false, message: 'Failed to fetch purchase orders', error: String(err && err.message || err) });
-  }
-});
-
-// Get single purchase order with items
-app.get('/purchase-orders/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-      
-       const poRes = await pool.query(
-      `SELECT id, supplier_id, created_by, status, total, notes, created_at
-       FROM purchase_orders WHERE id = $1 LIMIT 1`,
-      [id]
-    );
-    if (poRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Purchase order not found' });
-    const po = poRes.rows[0];
-
-    const itemsRes = await pool.query(
-      `SELECT poi.*, i.name AS ingredient_name
-       FROM purchase_order_items poi
-       LEFT JOIN ingredients i ON i.id = poi.ingredient_id
-       WHERE poi.po_id = $1
-       ORDER BY poi.id`,
-      [id]
-    );
-
-    po.items = (itemsRes.rows || []).map(it => ({
-      id: it.id,
-      ingredient_id: it.ingredient_id,
-      ingredient_name: it.ingredient_name,
-      qty: it.qty,
-      unit: it.unit,
-      unit_cost: it.unit_cost,
-      created_at: it.created_at
-    }));
-
-    return res.json(po);
-  } catch (err) {
-    console.error('❌ /purchase-orders/:id error:', err && (err.message || err));
-    return res.status(500).json({ success: false, message: 'Failed to fetch purchase order', error: String(err && err.message || err) });
-  }
-});
-
-// Delete a purchase order (only allowed when not received)
-app.delete('/purchase-orders/:id', async (req, res) => {
-  const { id } = req.params;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // ensure PO exists
-
-    const poRes = await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
-    if (poRes.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ success: false, message: 'Purchase order not found' });
-    }
-    const po = poRes.rows[0];
-    if (po.status === 'received') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'Cannot delete a received purchase order' });
-    }
-
-    // delete items (schema uses po_id)
-    await client.query('DELETE FROM purchase_order_items WHERE po_id = $1', [id]);
-    // delete the purchase order
-    await client.query('DELETE FROM purchase_orders WHERE id = $1', [id]);
-
-    await client.query('COMMIT');
-    return res.json({ success: true, message: 'Purchase order deleted', id });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('delete PO error', err);
-    return res.status(500).json({ success: false, message: 'Server error', error: String(err.message) });
-  } finally {
-    client.release();
-  }
-});
-
-// ✅ Create purchase order
-app.post('/purchase-orders', async (req, res) => {
-  const { supplier_id = null, items = [] } = req.body || {};
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ success: false, message: 'Items required' });
- }
-  try {
-    // --- ADDED: basic input validation ---
-    for (const it of items) {
-      const qty = Number(it.qty);
-      const cost = Number(it.unit_cost);
-      if (!Number.isFinite(qty) || qty <= 0) {
-        return res.status(400).json({ success: false, message: 'Invalid item quantity' });
-      }
-      if (!Number.isFinite(cost) || cost < 0) {
-        return res.status(400).json({ success: false, message: 'Invalid item cost' });
-      }
-    }
-
-    const client = await pool.connect();
-    await client.query('BEGIN');
-
-    // calculate total (sum qty * unit_cost) safely
-    const total = items.reduce((sum, it) => sum + (Number(it.qty || 0) * Number(it.unit_cost || 0)), 0);
-
-    const poInsert = await client.query(
-      `INSERT INTO purchase_orders (supplier_id, status, total, created_at)
-       VALUES ($1, $2, $3, NOW()) RETURNING id`,
-      [supplier_id, 'placed', total]
-    );
-    const poId = poInsert.rows[0].id;
-
-    const insertItemText =
-      `INSERT INTO purchase_order_items (po_id, ingredient_id, qty, unit, unit_cost, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())`;
-
-    for (const it of items) {
-      await client.query(insertItemText, [
-        poId,
-        Number(it.ingredient_id),
-        Number(it.qty || 0),
-        it.unit ?? null,
-        Number(it.unit_cost || 0),
-      ]);
-    }
-
-    await client.query('COMMIT');
-    return res.status(201).json({ success: true, id: poId });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('/purchase-orders POST error', err);
-    return res.status(500).json({ success: false, message: 'Server error', error: String(err?.message ?? err) });
-   } finally {
-    client.release();
-  }
-});
-
-// --- DISABLE OTP: do not initialize providers (safe) ---
-let twilioClient = null;
-let mailer = null;
-console.log('OTP functionality disabled: twilio and smtp not initialized.')
-
-// --- DISABLE OTP ROUTES ---
-// reply immediately that OTP is disabled instead of trying to send
-app.post('/admin/send-test-otp', (req, res) => {
-  return res.status(410).json({
-    ok: false,
-    error: 'otp_disabled',
-    message: 'OTP functionality has been disabled by admin. Use admin credentials/pin flows instead.'
-  });
-});
-
-// If you had other OTP endpoints, disable them too (example)
-app.post('/auth/request-otp', (req, res) => {
-  return res.status(410).json({
-    ok: false,
-    error: 'otp_disabled',
-    message: 'OTP functionality has been disabled by admin.'
-  });
-});
-
-app.post("/set-pin", async (req, res) => {
-  try {
-    const { username, pin } = req.body || {};
-    if (!username || !pin) return res.status(400).json({ success: false, message: "username and pin required" });
-    if (!/^\d{4,6}$/.test(String(pin))) return res.status(400).json({ success: false, message: "PIN must be 4-6 digits" });
-    const result = await pool.query("UPDATE users SET pin = $1 WHERE username = $2 RETURNING id, username", [String(pin), String(username)]);
-    if (!result.rows || result.rows.length === 0) return res.status(404).json({ success: false, message: "User not found" });
-    return res.json({ success: true, message: "PIN set" });
-  } catch (err) {
-    console.error("/set-pin error:", err && (err.stack || err));
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
-});
-
-app.post('/purchase-orders/:id/receive-with-admin', async (req, res) => {
-  const { id } = req.params;
-  const { admin_password, admin_pin } = req.body || {};
-  try {
-    const admin = await authenticateAdmin({ admin_password, admin_pin });
-    if (!admin) return res.status(401).json({ success: false, message: 'Unauthorized: admin password and PIN required and must match the same admin' });
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      const poRes = await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
-      if (poRes.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Purchase order not found' }); }
-      if (poRes.rows[0].status === 'received') { await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: 'Purchase order already received' }); }
-
-      const itemsRes = await client.query('SELECT * FROM purchase_order_items WHERE po_id = $1', [id]);
-      for (const it of (itemsRes.rows || [])) {
-        const qty = Number(it.qty || 0);
-        if (qty === 0) continue;
-        await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [qty, it.ingredient_id]);
-        await client.query(`INSERT INTO ingredient_additions (ingredient_id, amount, date, source) VALUES ($1, $2, NOW(), $3)`, [it.ingredient_id, qty, `PO:${id}`]);
-      }
-
-      await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2', ['received', id]);
-      await client.query('COMMIT');
-      return res.json({ success: true, message: 'PO received', id, processedBy: admin.username });
-    } catch (err) {
-      await client.query('ROLLBACK').catch(()=>{});
-      console.error('receive-with-admin error', err && (err.stack || err));
-      return res.status(500).json({ success: false, message: 'Server error', error: String(err?.message || err) });
-    } finally {
-      client.release();
-    }
-  } catch (err) {
-    console.error('/purchase-orders/:id/receive-with-admin error:', err && (err.stack || err));
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-
-app.post("/login-pin", async (req, res) => {
-  try {
-    const { pin } = req.body || {};
-    if (!pin) return res.status(400).json({ success: false, message: "PIN required" });
-    const q = await pool.query("SELECT id, username, role FROM users WHERE COALESCE(pin,'') = $1 LIMIT 1", [String(pin)]);
-    if (!q.rows || q.rows.length === 0) return res.status(401).json({ success: false, message: "Invalid PIN" });
-    return res.json({ success: true, id: q.rows[0].id, username: q.rows[0].username, role: q.rows[0].role });
-  } catch (err) {
-    console.error("/login-pin error:", err && (err.stack || err));
-    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
