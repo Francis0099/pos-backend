@@ -827,7 +827,10 @@ app.put("/products/:id", async (req, res) => {
   try {
     const sql = `
       UPDATE products
-      SET name = $1, category = $2, price = $3, photo = CASE WHEN $4 IS NULL THEN photo ELSE $4 END
+      SET name = $1,
+          category = $2,
+          price = $3,
+          photo = COALESCE($4::text, photo)
       WHERE id = $5
       RETURNING id, name, category, price, sku, photo, is_active
     `;
