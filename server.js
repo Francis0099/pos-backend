@@ -299,7 +299,27 @@ app.post("/login", async (req, res) => {
 
     // success -> reset attempts
     resetAttempts(key);
-    return res.json({ success: true, id: user.id, username: user.username, role: user.role });
+    const deviceId = (req.body && req.body.device_id) ? String(req.body.device_id) : null;
+    const role = String(user.role || "").toLowerCase();
+    if (role === "admin" || role === "superadmin") {
+      const active = await getActiveSessionForUser(user.id);
+      if (active && active.active_session_token && active.active_session_expires && new Date(active.active_session_expires) > new Date()) {
+        // active, non-expired session exists
+        if (active.active_session_device !== deviceId) {
+          return res.status(423).json({ success: false, message: "Admin already logged in from another device" });
+        }
+        // same device: extend session
+        const updated = await createOrUpdateSession(user.id, deviceId);
+        return res.json({ success: true, id: user.id, username: user.username, role: user.role, adminSessionToken: updated.token, adminSessionExpires: updated.expires });
+      } else {
+        // no active session / expired -> create one
+        const created = await createOrUpdateSession(user.id, deviceId);
+        return res.json({ success: true, id: user.id, username: user.username, role: user.role, adminSessionToken: created.token, adminSessionExpires: created.expires });
+      }
+    } else {
+      // non-admin: normal login behavior
+      return res.json({ success: true, id: user.id, username: user.username, role: user.role });
+    }
   } catch (err) {
     console.error("❌ Login query error:", err);
     // Note: do not call recordFailedAttempt on DB error
@@ -1818,6 +1838,8 @@ app.post("/refund-sale", async (req, res) => {
       return res.status(404).json({ success: false, message: "Sale not found" });
     }
 
+
+
     // if items not provided, build from sale_items (full-sale refund)
     let itemsToRefund = Array.isArray(items) && items.length ? items.map(i => ({ productId: Number(i.productId || i.id), quantity: Number(i.quantity || i.qty || 0) })) : [];
     if (itemsToRefund.length === 0) {
@@ -2295,6 +2317,70 @@ app.post("/login-pin", async (req, res) => {
   } catch (err) {
     console.error('/login-pin error:', err && (err.stack || err));
     return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// --- SINGLE-ADMIN-SESSION HELPERS ---
+const SESSION_TTL_MINUTES = Number(process.env.ADMIN_SESSION_TTL_MINUTES || 15);
+
+async function getActiveSessionForUser(userId) {
+  const r = await pool.query(
+    "SELECT active_session_token, active_session_device, active_session_expires FROM users WHERE id = $1 LIMIT 1",
+    [userId]
+  );
+  return r.rows && r.rows[0] ? r.rows[0] : null;
+}
+
+async function createOrUpdateSession(userId, deviceId) {
+  const token = crypto.randomBytes(24).toString("hex");
+  const expires = new Date(Date.now() + SESSION_TTL_MINUTES * 60_000).toISOString();
+  await pool.query(
+    `UPDATE users SET active_session_token = $1, active_session_device = $2, active_session_expires = $3 WHERE id = $4`,
+    [token, deviceId ?? null, expires, userId]
+  );
+  return { token, expires };
+}
+
+async function clearSessionForUser(userId) {
+  await pool.query(
+    `UPDATE users SET active_session_token = NULL, active_session_device = NULL, active_session_expires = NULL WHERE id = $1`,
+    [userId]
+  );
+}
+
+// endpoint: logout (client should call when leaving admin dashboard)
+app.post("/admin/logout", async (req, res) => {
+  try {
+    const { userId, token } = req.body || {};
+    if (!userId) return res.status(400).json({ success: false, message: "userId required" });
+    const sess = await getActiveSessionForUser(userId);
+    if (!sess || !sess.active_session_token) return res.json({ success: true });
+    if (token && sess.active_session_token && token !== sess.active_session_token) {
+      // token mismatch: not authorized to clear
+      return res.status(401).json({ success: false, message: "Invalid session token" });
+    }
+    await clearSessionForUser(userId);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("/admin/logout error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// endpoint: keepalive (extend session expiry)
+app.post("/admin/session-keepalive", async (req, res) => {
+  try {
+    const { userId, token } = req.body || {};
+    if (!userId || !token) return res.status(400).json({ success: false, message: "userId and token required" });
+    const sess = await getActiveSessionForUser(userId);
+    if (!sess || sess.active_session_token !== token) return res.status(401).json({ success: false, message: "Invalid session" });
+    // extend expiry
+    const newExpires = new Date(Date.now() + SESSION_TTL_MINUTES * 60_000).toISOString();
+    await pool.query("UPDATE users SET active_session_expires = $1 WHERE id = $2", [newExpires, userId]);
+    return res.json({ success: true, expires: newExpires });
+  } catch (err) {
+    console.error("/admin/session-keepalive error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
