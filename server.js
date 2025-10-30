@@ -1,5 +1,6 @@
 require('dotenv').config();
 
+console.log("✅ TAX_RATE:", process.env.TAX_RATE, "TAX_INCLUSIVE:", process.env.TAX_INCLUSIVE);
 // normalize env strings (remove trailing spaces) and canonicalize SMTP_SECURE
 Object.keys(process.env).forEach(k => {
   if (typeof process.env[k] === 'string') process.env[k] = process.env[k].trim();
