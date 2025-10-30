@@ -1129,10 +1129,12 @@ app.put("/products/:id/ingredients", async (req, res) => {
       }
     }
 
+    // Read old ingredient ids so we can recompute stocks for all affected products later
+    const oldIngrRes = await client.query('SELECT DISTINCT ingredient_id FROM product_ingredients WHERE product_id = $1', [id]);
+    const oldIngredientIds = (oldIngrRes.rows || []).map(r => Number(r.ingredient_id)).filter(Boolean);
+
     // Delete old ingredients for this product
-    await client.query("DELETE FROM product_ingredients WHERE product_id = $1", [
-      id,
-    ]);
+    await client.query("DELETE FROM product_ingredients WHERE product_id = $1", [id]);
 
     // Insert new ingredients if provided - include amount_unit (product-specific UOM)
     if (ingredients.length > 0) {
@@ -1153,12 +1155,36 @@ app.put("/products/:id/ingredients", async (req, res) => {
       await client.query(sql, values);
     }
 
-    // --- NEW: recompute product stock for this product and persist ---
+    // Recompute stock for all products affected by the change:
+    // any product that references an ingredient in (oldIngredientIds ∪ newIngredientIds)
     try {
-      const computedStock = await computeProductStock(id, client);
-      await client.query('UPDATE products SET stock = $1 WHERE id = $2', [computedStock, id]);
+      const newIngredientIds = Array.isArray(ingredients) && ingredients.length > 0
+        ? ingredients.map(x => Number(x.ingredientId)).filter(Boolean)
+        : [];
+
+      const affectedIngredientIds = Array.from(new Set([...(oldIngredientIds || []), ...(newIngredientIds || [])])).filter(Boolean);
+
+      // find all product_ids that reference any affected ingredient
+      let productsToUpdate = new Set([Number(id)]);
+      if (affectedIngredientIds.length > 0) {
+        const prodRefRes = await client.query(
+          'SELECT DISTINCT product_id FROM product_ingredients WHERE ingredient_id = ANY($1)',
+          [affectedIngredientIds]
+        );
+        for (const r of prodRefRes.rows || []) productsToUpdate.add(Number(r.product_id));
+      }
+
+      // recompute & persist stock for each affected product (transactional)
+      for (const pid of productsToUpdate) {
+        try {
+          const computedStock = await computeProductStock(pid, client);
+          await client.query('UPDATE products SET stock = $1 WHERE id = $2', [computedStock, pid]);
+        } catch (e) {
+          console.error('Failed to recompute stock for product', pid, e && (e.stack || e));
+        }
+      }
     } catch (e) {
-      console.error('computeProductStock error for product', id, e && e.stack || e);
+      console.error('computeProductStock (batch) error for product', id, e && e.stack || e);
     }
 
     await client.query("COMMIT");
@@ -2409,10 +2435,17 @@ app.get('/products-split-stock', async (req, res) => {
       }
 
       const available = counts.length > 0 ? Math.min(...counts) : 0;
+
       out.push({
-        id: p.id, name: p.name, price: p.price !== null ? Number(p.price) : 0,
-        category: p.category, sku: p.sku, photo: p.photo, color: p.color,
-        is_active: p.is_active, stock: available
+        id: p.id,
+        name: p.name,
+        price: p.price !== null ? Number(p.price) : 0,
+        category: p.category,
+        sku: p.sku,
+        photo: p.photo,
+        color: p.color,
+        is_active: p.is_active,
+        stock: available,
       });
     }
 
