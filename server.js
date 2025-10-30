@@ -1489,37 +1489,7 @@ app.get('/best-sellers', async (req, res) => {
   }
 });
 
-// Sales report (bucketed) subtracting refunds
-app.get("/sales-report", async (req, res) => {
-  try {
-    const period = (req.query.period || "day").toLowerCase();
-    const trunc = period === "month" ? "month" : period === "week" ? "week" : "day";
-
-    const sql = `
-      SELECT
-        to_char(date_trunc($1, s.created_at), 'YYYY-MM-DD') AS bucket,
-        p.name AS product,
-        COALESCE(SUM(GREATEST(si.quantity - COALESCE(ri.refunded_qty,0),0)),0)::int AS total_sold
-      FROM sale_items si
-      JOIN sales s ON s.id = si.sale_id
-      JOIN products p ON p.id = si.product_id
-      LEFT JOIN (
-        SELECT r.sale_id, ri.product_id, SUM(ri.quantity)::int AS refunded_qty
-        FROM refund_items ri
-        JOIN refunds r ON r.id = ri.refund_id
-        GROUP BY r.sale_id, ri.product_id
-      ) ri ON ri.sale_id = si.sale_id AND ri.product_id = si.product_id
-      WHERE s.created_at >= (now() - interval '1 year')
-      GROUP BY bucket, p.name
-      ORDER BY bucket DESC, total_sold DESC;
-    `;
-    const { rows } = await pool.query(sql, [trunc]);
-    res.json({ items: rows });
-  } catch (err) {
-    console.error("sales-report error:", err);
-    res.status(500).json({ success: false, message: "Failed to fetch sales report" });
-  }
-});
+// 📊 Sales report endpoint
 app.get("/sales-report", async (req, res) => {
   const period = String(req.query.period || "day");
 
@@ -1837,12 +1807,6 @@ app.post("/refund-sale", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, message: "Sale not found" });
     }
-
-
-
-
-
-
 
     // if items not provided, build from sale_items (full-sale refund)
     let itemsToRefund = Array.isArray(items) && items.length ? items.map(i => ({ productId: Number(i.productId || i.id), quantity: Number(i.quantity || i.qty || 0) })) : [];
@@ -2352,60 +2316,36 @@ async function clearSessionForUser(userId) {
   );
 }
 
-// endpoint: logout (client should call when leaving admin dashboard)
-app.post("/admin/logout", async (req, res) => {
+// --- Add: admin session verification middleware + optional notifier ---
+const EventEmitter = require('events');
+const adminNotifier = new EventEmitter();
+// keep weak map of in-memory listeners if you have WebSocket/SSE connections:
+// const adminWsClients = new Map(); // key: userId -> Set(ws)
+
+async function verifyAdminSession(req, res, next) {
   try {
-    const { userId, token } = req.body || {};
-    if (!userId) return res.status(400).json({ success: false, message: "userId required" });
+    // accept token/userId from header first (safer for single-page/app usage), then body/query
+    const token = (req.headers['x-admin-token'] || req.body?.token || req.query?.token) ? String(req.headers['x-admin-token'] || req.body?.token || req.query?.token) : null;
+    const userIdRaw = req.headers['x-user-id'] || req.body?.userId || req.query?.userId;
+    const userId = Number(userIdRaw);
+    if (!userId || !token) return res.status(401).json({ success: false, message: 'userId and token required' });
+
     const sess = await getActiveSessionForUser(userId);
-    if (!sess || !sess.active_session_token) return res.json({ success: true });
-    if (token && sess.active_session_token && token !== sess.active_session_token) {
-      // token mismatch: not authorized to clear
-      return res.status(401).json({ success: false, message: "Invalid session token" });
+    if (!sess || !sess.active_session_token || sess.active_session_token !== token) {
+      return res.status(401).json({ success: false, message: 'Invalid session' });
     }
-    await clearSessionForUser(userId);
-    return res.json({ success: true });
+    if (sess.active_session_expires && new Date(sess.active_session_expires) <= new Date()) {
+      return res.status(401).json({ success: false, message: 'Session expired' });
+    }
+
+    // attach session info for handlers
+    req.adminSession = { userId, token, expires: sess.active_session_expires };
+    return next();
   } catch (err) {
-    console.error("/admin/logout error:", err && (err.stack || err));
-    return res.status(500).json({ success: false, message: "Server error" });
+    console.error('verifyAdminSession error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
-});
-
-// endpoint: keepalive (extend session expiry)
-app.post("/admin/session-keepalive", async (req, res) => {
-  try {
-    const { userId, token } = req.body || {};
-    if (!userId || !token) return res.status(400).json({ success: false, message: "userId and token required" });
-    const sess = await getActiveSessionForUser(userId);
-    if (!sess || sess.active_session_token !== token) return res.status(401).json({ success: false, message: "Invalid session" });
-    // extend expiry
-    const newExpires = new Date(Date.now() + SESSION_TTL_MINUTES * 60_000).toISOString();
-    await pool.query("UPDATE users SET active_session_expires = $1 WHERE id = $2", [newExpires, userId]);
-    return res.json({ success: true, expires: newExpires });
-  } catch (err) {
-    console.error("/admin/session-keepalive error:", err && (err.stack || err));
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
-});
-
-// ADMIN: force clear session (requires ADMIN_KEY in env)
-app.post("/admin/force-logout", async (req, res) => {
-  try {
-    const { userId, adminKey } = req.body || {};
-    if (!process.env.ADMIN_KEY) return res.status(500).json({ success: false, message: "ADMIN_KEY not configured" });
-    if (String(adminKey || "") !== String(process.env.ADMIN_KEY)) return res.status(401).json({ success: false, message: "Forbidden" });
-    if (!userId) return res.status(400).json({ success: false, message: "userId required" });
-    await clearSessionForUser(userId);
-    console.log(`ADMIN_FORCE_LOGOUT: cleared session for user ${userId} via admin key`);
-    return res.json({ success: true, message: "Session cleared" });
-  } catch (err) {
-    console.error("/admin/force-logout error:", err && (err.stack || err));
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
-});
-
-// Start HTTP server (ensure this is present once at the end of the file)
-
+}
 
 // optional simple request logger to diagnose 404s
 app.use((req, _res, next) => {
@@ -2498,6 +2438,85 @@ app.get('/products-split-stock', async (req, res) => {
   } catch (err) {
     console.error('❌ /products-split-stock error:', err && (err.message || err));
     return res.status(500).json({ success: false, message: 'Failed to compute split stock' });
+  }
+});
+
+app.post('/admin/logout', verifyAdminSession, async (req, res) => {
+  try {
+    const uid = req.adminSession.userId;
+    await clearSessionForUser(uid);
+    try { adminNotifier.emit(`force-logout:${uid}`, { userId: uid }); } catch (e) {}
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('/admin/logout error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.post('/admin/session-keepalive', verifyAdminSession, async (req, res) => {
+  try {
+    const uid = req.adminSession.userId;
+    const newExpires = new Date(Date.now() + SESSION_TTL_MINUTES * 60_000).toISOString();
+    await pool.query('UPDATE users SET active_session_expires = $1 WHERE id = $2', [newExpires, uid]);
+    return res.json({ success: true, expires: newExpires });
+  } catch (err) {
+    console.error('/admin/session-keepalive error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.get('/sse/admin', (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).end('userId required');
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.write('\n');
+
+  const evName = `force-logout:${userId}`;
+  const listener = (payload) => {
+    try {
+      res.write(`event: force-logout\n`);
+      res.write(`data: ${JSON.stringify(payload ?? {})}\n\n`);
+    } catch (e) {
+      // ignore write errors
+    }
+  };
+
+  adminNotifier.on(evName, listener);
+
+  // heartbeat to keep connection alive through proxies
+  const hb = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch (e) {}
+  }, 25_000);
+
+  req.on('close', () => {
+    clearInterval(hb);
+    adminNotifier.removeListener(evName, listener);
+  });
+});
+
+app.post("/admin/force-logout", async (req, res) => {
+  try {
+    const { userId, adminKey } = req.body || {};
+    if (!process.env.ADMIN_KEY) return res.status(500).json({ success: false, message: "ADMIN_KEY not configured" });
+    if (String(adminKey || "") !== String(process.env.ADMIN_KEY)) return res.status(401).json({ success: false, message: "Forbidden" });
+    if (!userId) return res.status(400).json({ success: false, message: "userId required" });
+
+    await clearSessionForUser(userId);
+
+    // notify any SSE subscribers for that user
+    try { adminNotifier.emit(`force-logout:${userId}`, { userId }); } catch (e) {}
+
+    console.log(`ADMIN_FORCE_LOGOUT: cleared session for user ${userId} via admin key`);
+    return res.json({ success: true, message: "Session cleared" });
+  } catch (err) {
+    console.error("/admin/force-logout error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
