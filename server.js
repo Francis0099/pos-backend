@@ -200,6 +200,7 @@ app.get("/products-with-stock", async (req, res) => {
         const invInProdUnits = convertInventoryToProductUnits(invAmt, invUnit, prodUnit, {
           piece_amount: r.piece_amount,
           piece_unit: r.piece_unit,
+          pieces_per_pack: r.pieces_per_pack
         });
 
         if (!Number.isFinite(invInProdUnits)) {
@@ -477,6 +478,7 @@ app.post('/submit-order', async (req, res) => {
         const converted = convertToInventoryUnits(amountNeeded, r.product_unit, r.inventory_unit, {
           piece_amount: r.piece_amount,
           piece_unit: r.piece_unit,
+          pieces_per_pack: r.pieces_per_pack
         });
         const amountUsed = Number.isFinite(converted) ? converted : amountNeeded;
         console.warn('[SUBMIT_ORDER] ingredient=', r.ingredient_id, 'amountNeeded=', amountNeeded, 'amountUsed=', amountUsed);
@@ -562,6 +564,7 @@ async function computeProductStock(productId, clientOrPool = pool) {
     const invInProdUnits = convertInventoryToProductUnits(invAmt, invUnit, prodUnit, {
       piece_amount: r.piece_amount,
       piece_unit: r.piece_unit,
+      pieces_per_pack: r.pieces_per_pack
     });
 
     if (!Number.isFinite(invInProdUnits)) {
@@ -1136,14 +1139,14 @@ app.put("/products/:id/ingredients", async (req, res) => {
       const params = [];
       const values = [];
       ingredients.forEach((ing, idx) => {
-        const base = idx * 4;
-        params.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`);
-        // product_id, ingredient_id, amount_needed, amount_unit
-        values.push(id, ing.ingredientId, Number(ing.amount), ing.unit ?? null);
+        const base = idx * 5;
+        params.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`);
+        // product_id, ingredient_id, amount_needed, amount_unit, pieces_per_pack
+        values.push(id, ing.ingredientId, Number(ing.amount), ing.unit ?? null, (typeof ing.pieces_per_pack !== 'undefined' ? ing.pieces_per_pack : null));
       });
 
       const sql = `
-        INSERT INTO product_ingredients (product_id, ingredient_id, amount_needed, amount_unit)
+        INSERT INTO product_ingredients (product_id, ingredient_id, amount_needed, amount_unit, pieces_per_pack)
         VALUES ${params.join(",")}
       `;
 
@@ -1828,6 +1831,7 @@ app.get('/dashboard-summary', async (req, res) => {
 
     // Best seller today
     const bestResult = await pool.query(`
+
       SELECT p.id, p.name, SUM(si.quantity) AS total_sold
 
       FROM sale_items si
@@ -2002,6 +2006,7 @@ app.post("/refund-sale", async (req, res) => {
           const perItemInventory = convertToInventoryUnits(prodAmount, prodUnit, invUnit, {
             piece_amount: row.piece_amount,
             piece_unit: row.piece_unit,
+            pieces_per_pack: row.pieces_per_pack
           });
 
           const restore = Number.isFinite(perItemInventory) ? perItemInventory * it.quantity : prodAmount * it.quantity;
@@ -2396,6 +2401,7 @@ app.get('/products-split-stock', async (req, res) => {
         const invInProdUnits = convertInventoryToProductUnits(allocatedInv, r.ingredient_unit, (r.amount_unit || r.ingredient_unit), {
           piece_amount: r.piece_amount,
           piece_unit: r.piece_unit,
+          pieces_per_pack: r.pieces_per_pack
         });
 
         if (!Number.isFinite(invInProdUnits)) counts.push(0);
