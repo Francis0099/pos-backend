@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 console.log("✅ TAX_RATE:", process.env.TAX_RATE, "TAX_INCLUSIVE:", process.env.TAX_INCLUSIVE);
+
 // normalize env strings (remove trailing spaces) and canonicalize SMTP_SECURE
 Object.keys(process.env).forEach(k => {
   if (typeof process.env[k] === 'string') process.env[k] = process.env[k].trim();
@@ -754,7 +755,7 @@ app.get("/products/:id", async (req, res) => {
 // ✅ Update product basic fields (name, category, price)
 app.put("/products/:id", async (req, res) => {
   const { id } = req.params;
-  const { name, category, price } = req.body;
+  const { name, category, price, photo } = req.body; // accept optional photo
 
   if (!name || !category || price === undefined || price === null) {
     return res.status(400).json({ success: false, message: "Missing required fields" });
@@ -767,19 +768,22 @@ app.put("/products/:id", async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      "UPDATE products SET name = $1, category = $2, price = $3 WHERE id = $4",
-      [normalizedName, category, numericPrice, id]
-    );
+    const sql = `
+      UPDATE products
+      SET name = $1, category = $2, price = $3, photo = CASE WHEN $4 IS NULL THEN photo ELSE $4 END
+      WHERE id = $5
+      RETURNING id, name, category, price, sku, photo, is_active
+    `;
+    const result = await pool.query(sql, [normalizedName, category, numericPrice, (photo ?? null), id]);
 
     if (result.rowCount === 0) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
 
-    res.json({ success: true });
+    return res.json({ success: true, product: result.rows[0] });
   } catch (err) {
-    console.error("❌ Error updating product:", err.message);
-    return res.status(500).json({ success: false, message: "Database error", error: err.message });
+    console.error("❌ Error updating product:", err && (err.message || err));
+    return res.status(500).json({ success: false, message: "Database error", error: String(err && err.message || err) });
   }
 });
 
@@ -1838,6 +1842,7 @@ app.get('/purchase-orders', async (req, res) => {
   try {
     const ordersRes = await pool.query(
       `SELECT id, supplier_id, created_by, status, total, notes, created_at
+      
        FROM purchase_orders
        ORDER BY created_at DESC`
     );
