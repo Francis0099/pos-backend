@@ -2009,6 +2009,45 @@ app.post("/set-pin", async (req, res) => {
   }
 });
 
+app.get("/purchase-orders", async (req, res) => {
+  try {
+    const sql = `
+      SELECT id, supplier_id, status, COALESCE(total,0)::numeric AS total, created_at
+      FROM purchase_orders
+      ORDER BY created_at DESC
+    `;
+    const result = await pool.query(sql);
+    return res.json(Array.isArray(result.rows) ? result.rows : []);
+  } catch (err) {
+    console.error("❌ /purchase-orders error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Failed to fetch purchase orders" });
+  }
+});
+
+// Purchase order detail (with items)
+app.get("/purchase-orders/:id", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const poRes = await pool.query("SELECT id, supplier_id, status, COALESCE(total,0)::numeric AS total, created_at FROM purchase_orders WHERE id = $1 LIMIT 1", [id]);
+    if (!poRes.rows || poRes.rows.length === 0) return res.status(404).json({ success: false, message: "Purchase order not found" });
+
+    const itemsRes = await pool.query(
+      `SELECT id, ingredient_id, qty, unit, unit_cost
+       FROM purchase_order_items
+       WHERE po_id = $1
+       ORDER BY id ASC`,
+      [id]
+    );
+
+    const po = poRes.rows[0];
+    po.items = itemsRes.rows || [];
+    return res.json(po);
+  } catch (err) {
+    console.error("❌ /purchase-orders/:id error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Failed to fetch purchase order detail" });
+  }
+});
+
 app.post('/purchase-orders/:id/receive-with-admin', async (req, res) => {
   const { id } = req.params;
   const { admin_password, admin_pin } = req.body || {};
