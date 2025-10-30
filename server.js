@@ -582,6 +582,7 @@ function normUnit(u) {
   if (["ml", "milliliter", "milliliters"].includes(s)) return "ml";
   if (["l", "liter", "liters"].includes(s)) return "l";
   if (["piece", "pieces", "pc", "pcs"].includes(s)) return "piece";
+  if (["pack","packs"].includes(s)) return "pack";
   if (["unit", "units"].includes(s)) return "unit";
   return s;
 }
@@ -603,24 +604,56 @@ function convertSimple(value, fromUnit, toUnit) {
 }
 
 /**
- * Convert amount expressed in productUnit to inventoryUnit using ingredientRow (supports piece sizing).
- * Returns converted numeric or NaN if conversion not possible.
+ * Convert amount expressed in productUnit to inventoryUnit using ingredientRow.
+ * Supports 'pack' by using ingredientRow.pieces_per_pack and piece_amount/piece_unit combos.
  */
 function convertToInventoryUnits(amount, productUnit, inventoryUnit, ingredientRow = {}) {
   const prodU = normUnit(productUnit || inventoryUnit);
   const invU = normUnit(inventoryUnit);
-  // direct/simple conversion (mass <-> mass, volume <-> volume)
+
+  // try direct convert inventory -> product unit (mass/volume conversions)
   const direct = convertSimple(amount, prodU, invU);
   if (!Number.isNaN(direct)) return direct;
 
   const pieceAmount = ingredientRow && ingredientRow.piece_amount != null ? Number(ingredientRow.piece_amount) : null;
   const pieceUnit = ingredientRow && ingredientRow.piece_unit ? String(ingredientRow.piece_unit) : null;
+  const piecesPerPack = ingredientRow && ingredientRow.pieces_per_pack != null ? Number(ingredientRow.pieces_per_pack) : null;
 
-  // inventory stored as pieces, product unit is mass/volume -> how many pieces needed?
+  // PRODUCT unit is 'pack'
+  if (prodU === "pack") {
+    //  pack -> piece (requires piecesPerPack)
+    if (invU === "piece") {
+      if (!piecesPerPack) return NaN;
+      return Number(amount) * piecesPerPack;
+    }
+    // pack -> inventory mass/volume: require per-piece mass/volume (piece_amount + piece_unit)
+    if ((invU === "g" || invU === "kg" || invU === "ml" || invU === "l") && pieceAmount && pieceUnit && piecesPerPack) {
+      const perPieceInv = convertSimple(pieceAmount, pieceUnit, invU);
+      if (Number.isNaN(perPieceInv)) return NaN;
+      return Number(amount) * piecesPerPack * perPieceInv;
+    }
+  }
+
+  // INVENTORY is 'pack' (rare) -> convert pack -> pieces or pack -> mass/volume
+  if (invU === "pack") {
+    if (prodU === "piece") {
+      if (!piecesPerPack) return NaN;
+      return Number(amount) / piecesPerPack;
+    }
+    if ((prodU === "g" || prodU === "kg" || prodU === "ml" || prodU === "l") && pieceAmount && pieceUnit && piecesPerPack) {
+      // how much inventory in productUnit per pack
+      const perPieceProdUnit = convertSimple(pieceAmount, pieceUnit, prodU);
+      if (Number.isNaN(perPieceProdUnit)) return NaN;
+      // inventoryAmount (packs) -> number of productUnits = packs * piecesPerPack * perPieceProdUnit
+      return Number(amount) * piecesPerPack * perPieceProdUnit;
+    }
+  }
+
+  // inventory stored as pieces and product expects mass/volume: each piece -> pieceAmount (pieceUnit) -> convert pieceUnit -> productUnit
   if (invU === "piece" && pieceAmount && pieceUnit) {
     const perPieceInProd = convertSimple(pieceAmount, pieceUnit, prodU);
-    if (!Number.isNaN(perPieceInProd) && perPieceInProd > 0) {
-      return Number(amount) / perPieceInProd;
+    if (!Number.isNaN(perPieceInProd)) {
+      return Number(amount) * perPieceInProd;
     }
   }
 
@@ -632,18 +665,13 @@ function convertToInventoryUnits(amount, productUnit, inventoryUnit, ingredientR
     }
   }
 
-  // conversion not possible
+  // otherwise conversion not possible
   return NaN;
 }
 
 /**
  * Determine if a product-level unit can be converted to the ingredient inventory unit.
- * Rules:
- * - mass <-> mass allowed (g, kg)
- * - volume <-> volume allowed (ml, l)
- * - piece <-> piece allowed
- * - piece <-> mass/volume allowed ONLY if ingredient has piece_amount + piece_unit and those units are convertible to the other side
- * - unit (generic) is non-convertible except when identical
+ * Extended to allow 'pack' conversions when pieces_per_pack present.
  */
 function canConvert(productUnit, inventoryUnit, ingredientRow = {}) {
   const p = normUnit(productUnit || inventoryUnit);
@@ -661,6 +689,11 @@ function canConvert(productUnit, inventoryUnit, ingredientRow = {}) {
   if (volumeSet.has(p) && volumeSet.has(i)) return true;
   // piece <-> piece allowed
   if (p === "piece" && i === "piece") return true;
+  // pack <-> piece allowed if pieces_per_pack present
+  if ((p === "pack" && i === "piece") || (p === "piece" && i === "pack")) {
+    const packSize = ingredientRow?.pieces_per_pack != null ? Number(ingredientRow.pieces_per_pack) : null;
+    return !!packSize && Number.isFinite(packSize) && packSize > 0;
+  }
 
   // piece <-> mass/volume only if ingredient defines piece_amount + piece_unit and that piece_unit can convert to the other unit
   if ((p === "piece" && (massSet.has(i) || volumeSet.has(i))) || (i === "piece" && (massSet.has(p) || volumeSet.has(p)))) {
@@ -995,34 +1028,23 @@ app.put("/products/:id", async (req, res) => {
 });
 
 // ✅ Get a product's ingredients and required amounts
-app.get("/products/:id/ingredients", async (req, res) => {
-  const { id } = req.params;
-
+app.get('/ingredients', async (req, res) => {
   const sql = `
-    SELECT i.id,
-           i.name,
-           COALESCE(pi.amount_unit, i.unit) AS unit,
-           pi.amount_needed AS amount
-    FROM product_ingredients pi
-    JOIN ingredients i ON i.id = pi.ingredient_id
-    WHERE pi.product_id = $1
-    ORDER BY i.name ASC
+    SELECT 
+      i.id, i.name, i.stock, i.unit,
+      i.pieces_per_pack,
+      i.piece_amount,
+      i.piece_unit,
+      COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
+      COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
+    FROM ingredients i;
   `;
-
   try {
-    const result = await pool.query(sql, [id]);
-
-    const items = result.rows.map(r => ({
-      id: r.id,
-      name: r.name,
-      unit: r.unit,
-      amount: Number(r.amount)
-    }));
-
-    res.json({ success: true, items });
+    const result = await pool.query(sql);
+    res.json(result.rows);
   } catch (err) {
-    console.error("❌ Error fetching product ingredients:", err.message);
-    res.status(500).json({ success: false, message: "Database error", error: err.message });
+    console.error('DB Fetch Error:', err);
+    res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
@@ -1127,7 +1149,7 @@ app.put("/products/:id/ingredients", async (req, res) => {
 
 // CREATE Ingredient
 app.post("/ingredients", async (req, res) => {
-  const { name, stock, unit } = req.body;
+  const { name, stock, unit, pieces_per_pack, piece_amount, piece_unit } = req.body;
 
   try {
     // ✅ Case-insensitive check using ILIKE
@@ -1142,10 +1164,10 @@ app.post("/ingredients", async (req, res) => {
         .json({ success: false, message: "Ingredient already exists" });
     }
 
-    // ✅ Insert new ingredient
+    // ✅ Insert new ingredient (pieces_per_pack optional)
     await pool.query(
-      "INSERT INTO ingredients (name, stock, unit) VALUES ($1, $2, $3)",
-      [name, stock, unit]
+      "INSERT INTO ingredients (name, stock, unit, pieces_per_pack, piece_amount, piece_unit) VALUES ($1, $2, $3, $4, $5, $6)",
+      [name, stock, unit, pieces_per_pack ?? null, piece_amount ?? null, piece_unit ?? null]
     );
 
     res.json({ success: true });
@@ -1406,7 +1428,8 @@ app.get('/ingredients/:id', async (req, res) => {
 
 app.put('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
-  const { name, stock, unit, source } = req.body;
+  // accept optional pieces_per_pack (integer), piece_amount (number) and piece_unit (string)
+  const { name, stock, unit, source, pieces_per_pack, piece_amount, piece_unit } = req.body;
 
   try {
     const getSql = 'SELECT stock FROM ingredients WHERE id = $1';
@@ -1417,8 +1440,33 @@ app.put('/ingredients/:id', async (req, res) => {
     const oldStock = getResult.rows[0].stock;
     const difference = stock - oldStock;
 
-    const updateSql = 'UPDATE ingredients SET name=$1, stock=$2, unit=$3 WHERE id=$4';
-    await pool.query(updateSql, [name, stock, unit, id]);
+    // validate pieces_per_pack when unit is 'pack'
+    if (String(unit).toLowerCase() === 'pack') {
+      const p = pieces_per_pack == null ? null : Number(pieces_per_pack);
+      if (!Number.isFinite(p) || p <= 0) {
+        return res.status(400).json({ success: false, message: 'pieces_per_pack must be a positive integer when unit is pack' });
+      }
+    }
+
+    const updateSql = `
+      UPDATE ingredients
+      SET name = $1,
+          stock = $2,
+          unit = $3,
+          pieces_per_pack = $4,
+          piece_amount = $5,
+          piece_unit = $6
+      WHERE id = $7
+    `;
+    await pool.query(updateSql, [
+      name,
+      stock,
+      unit,
+      pieces_per_pack ?? null,
+      typeof piece_amount !== 'undefined' ? (piece_amount === null ? null : Number(piece_amount)) : null,
+      piece_unit ?? null,
+      id,
+    ]);
 
     if (difference > 0) {
       // Log Restock
@@ -1442,7 +1490,6 @@ app.put('/ingredients/:id', async (req, res) => {
     res.status(500).json({ success: false, message: 'Database error' });
   }
 });
-
 
 app.delete('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
@@ -2314,7 +2361,7 @@ app.get('/products-split-stock', async (req, res) => {
 
         const invInProdUnits = convertInventoryToProductUnits(allocatedInv, r.ingredient_unit, (r.amount_unit || r.ingredient_unit), {
           piece_amount: r.piece_amount,
-          piece_unit: r.piece_unit
+          piece_unit: r.piece_unit,
         });
 
         if (!Number.isFinite(invInProdUnits)) counts.push(0);
