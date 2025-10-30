@@ -831,6 +831,11 @@ app.put("/products/:id", async (req, res) => {
       WHERE id = $5
       RETURNING id, name, category, price, sku, photo, is_active
     `;
+    // debug: log SQL and params to help diagnose DB errors
+    console.log("Executing UPDATE products SQL, params:", {
+      sql: sql.replace(/\s+/g, " ").trim().slice(0, 200) + "...",
+      paramsPreview: [String(normalizedName).slice(0, 60), String(category).slice(0, 60), numericPrice, String(photoToStore).slice(0,80), id],
+    });
     const result = await pool.query(sql, [normalizedName, category, numericPrice, (photoToStore ?? null), id]);
 
     if (result.rowCount === 0) {
