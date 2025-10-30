@@ -841,12 +841,16 @@ app.post("/add-product", async (req, res) => {
       for (const pi of ingredients) {
         const ingId = Number(pi.id);
         const amt = Number(pi.amount);
-        const unit = String(pi.unit || "");
-        const piecesPerPack = typeof pi.pack_size !== 'undefined' && pi.pack_size !== null ? Number(pi.pack_size) : null;
+        const unit = pi.unit != null ? String(pi.unit) : null;
+        // expect client to send `pieces_per_pack` (align with DB column)
+        const piecesPerPack = typeof pi.pieces_per_pack !== 'undefined' && pi.pieces_per_pack !== null
+          ? Number(pi.pieces_per_pack)
+          : null;
 
-        // Insert into product_ingredients; include pieces_per_pack column you added via migration
-        await pool.query(
-          `INSERT INTO product_ingredients (product_id, ingredient_id, amount, unit, pieces_per_pack)
+        // Use client.query so the insert participates in the current transaction
+        // NOTE: table columns are amount_needed / amount_unit in other code — use those names
+        await client.query(
+          `INSERT INTO product_ingredients (product_id, ingredient_id, amount_needed, amount_unit, pieces_per_pack)
            VALUES ($1, $2, $3, $4, $5)`,
           [productId, ingId, amt, unit, piecesPerPack]
         );
