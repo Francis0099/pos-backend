@@ -262,21 +262,28 @@ app.get("/products-all-admin", async (req, res) => {
 // Example: replace your handler SQL calls with dbQuery(...) so errors are logged with the SQL.
 app.post("/login", async (req, res) => {
   const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ success: false, message: "Missing credentials" });
+  if (!username || !password)
+    return res
+      .status(400)
+      .json({ success: false, message: "Missing credentials" });
 
   console.log("DEBUG /login env:", {
-  DATABASE_URL: process.env.DATABASE_URL,
-  DB_USER: process.env.DB_USER,
-  PGUSER: process.env.PGUSER,
-  USER: process.env.USER
-});
-
+    DATABASE_URL: process.env.DATABASE_URL,
+    DB_USER: process.env.DB_USER,
+    PGUSER: process.env.PGUSER,
+    USER: process.env.USER,
+  });
 
   const key = loginKeyFromReq(req);
   const lock = isLocked(key);
   if (lock.locked) {
     const secs = Math.ceil(lock.remainingMs / 1000);
-    return res.status(429).json({ success: false, message: `Too many attempts. Try again in ${secs} seconds`});
+    return res
+      .status(429)
+      .json({
+        success: false,
+        message: `Too many attempts. Try again in ${secs} seconds`,
+      });
   }
 
   try {
@@ -284,8 +291,8 @@ app.post("/login", async (req, res) => {
       "SELECT id, username, password, role FROM users WHERE username = $1 LIMIT 1",
       [username]
     );
+
     if (!result.rows || result.rows.length === 0) {
-      // record failed attempt for unknown username too
       recordFailedAttempt(key);
       return res.json({ success: false, message: "Invalid credentials" });
     }
@@ -293,6 +300,7 @@ app.post("/login", async (req, res) => {
     const user = result.rows[0];
     const stored = String(user.password || "");
     let ok = false;
+
     if (stored.startsWith("$2")) {
       ok = bcrypt.compareSync(password, stored);
     } else {
@@ -304,33 +312,59 @@ app.post("/login", async (req, res) => {
       return res.json({ success: false, message: "Invalid credentials" });
     }
 
-    // success -> reset attempts
+    // ✅ success: reset attempts
     resetAttempts(key);
-    const deviceId = (req.body && req.body.device_id) ? String(req.body.device_id) : null;
-    const role = String(user.role || "").toLowerCase();
-    if (role === "admin" || role === "superadmin") {
-      const active = await getActiveSessionForUser(user.id);
-      if (active && active.active_session_token && active.active_session_expires && new Date(active.active_session_expires) > new Date()) {
-        // active, non-expired session exists
-        if (active.active_session_device !== deviceId) {
-          return res.status(423).json({ success: false, message: "Admin already logged in from another device" });
-        }
-        // same device: extend session
-        const updated = await createOrUpdateSession(user.id, deviceId);
-        return res.json({ success: true, id: user.id, username: user.username, role: user.role, adminSessionToken: updated.token, adminSessionExpires: updated.expires });
-      } else {
-        // no active session / expired -> create one
-        const created = await createOrUpdateSession(user.id, deviceId);
-        return res.json({ success: true, id: user.id, username: user.username, role: user.role, adminSessionToken: created.token, adminSessionExpires: created.expires });
+
+    const deviceId =
+      req.body && req.body.device_id ? String(req.body.device_id) : null;
+
+    // ✅ unified single-active-session logic (for all users)
+    const active = await getActiveSessionForUser(user.id);
+    if (
+      active &&
+      active.active_session_token &&
+      active.active_session_expires &&
+      new Date(active.active_session_expires) > new Date()
+    ) {
+      // active, non-expired session exists
+      if (active.active_session_device !== deviceId) {
+        return res
+          .status(423)
+          .json({
+            success: false,
+            message: "User already logged in from another device",
+          });
       }
+      // same device → extend session
+      const updated = await createOrUpdateSession(user.id, deviceId);
+      return res.json({
+        success: true,
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        sessionToken: updated.token,
+        sessionExpires: updated.expires,
+      });
     } else {
-      // non-admin: normal login behavior
-      return res.json({ success: true, id: user.id, username: user.username, role: user.role });
+      // no active session → create one
+      const created = await createOrUpdateSession(user.id, deviceId);
+      return res.json({
+        success: true,
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        sessionToken: created.token,
+        sessionExpires: created.expires,
+      });
     }
   } catch (err) {
     console.error("❌ Login query error:", err);
-    // Note: do not call recordFailedAttempt on DB error
-    return res.status(500).json({ success: false, message: "Database error", error: err.message, detail: err.stack?.split("\n")[0] });
+    return res.status(500).json({
+      success: false,
+      message: "Database error",
+      error: err.message,
+      detail: err.stack?.split("\n")[0],
+    });
   }
 });
 
