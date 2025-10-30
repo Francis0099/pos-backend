@@ -41,6 +41,59 @@ const path = require('path');
 // create app FIRST
 const app = express();
 
+// --- LOGIN RATE LIMITER (in-memory, incremental backoff) ---
+const loginAttempts = new Map();
+/*
+  Map value shape:
+  {
+    failedCount: number,        // failures since last lock
+    penaltyLevel: number,       // number of times lock applied (1 => 3min, 2 => 6min, ...)
+    lockUntil: number | null    // timestamp ms until unlocking
+  }
+*/
+const LOCK_WINDOW_MINUTES = 3;
+const MAX_ATTEMPTS = 5;
+
+function loginKeyFromReq(req) {
+  const body = req.body || {};
+  // prefer username, then device_id (client may send), then pin, then IP fallback
+  const raw = (body.username || body.device_id || body.pin || req.ip || "anon").toString();
+  return raw.trim().toLowerCase();
+}
+
+function getAttemptInfo(key) {
+  const info = loginAttempts.get(key);
+  if (!info) return { failedCount: 0, penaltyLevel: 0, lockUntil: null };
+  return info;
+}
+
+function isLocked(key) {
+  const info = getAttemptInfo(key);
+  if (info.lockUntil && Date.now() < info.lockUntil) {
+    return { locked: true, remainingMs: info.lockUntil - Date.now(), info };
+  }
+  return { locked: false, remainingMs: 0, info };
+}
+
+function recordFailedAttempt(key) {
+  const info = getAttemptInfo(key);
+  info.failedCount = (info.failedCount || 0) + 1;
+  // if exceeds limit, apply lock and increment penaltyLevel
+  if (info.failedCount >= MAX_ATTEMPTS) {
+    info.penaltyLevel = (info.penaltyLevel || 0) + 1;
+    const minutes = LOCK_WINDOW_MINUTES * info.penaltyLevel;
+    info.lockUntil = Date.now() + minutes * 60 * 1000;
+    info.failedCount = 0; // reset counter after lock
+    console.warn(`Login lock applied for key=${key} for ${minutes} minutes (penaltyLevel=${info.penaltyLevel})`);
+  }
+  loginAttempts.set(key, info);
+  return info;
+}
+
+function resetAttempts(key) {
+  loginAttempts.delete(key);
+}
+
 // middleware
 app.use(cors({
   origin: "*",
@@ -57,7 +110,7 @@ if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 app.use('/uploads', express.static(uploadsDir));
 
 // Health check
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', (_req, res) => res.json({ ok: true }))
 
 
 const pool = new Pool({
@@ -212,16 +265,26 @@ app.post("/login", async (req, res) => {
 });
 
 
+  const key = loginKeyFromReq(req);
+  const lock = isLocked(key);
+  if (lock.locked) {
+    const secs = Math.ceil(lock.remainingMs / 1000);
+    return res.status(429).json({ success: false, message: `Too many attempts. Try again in ${secs} seconds`});
+  }
+
   try {
     const result = await pool.query(
       "SELECT id, username, password, role FROM users WHERE username = $1 LIMIT 1",
       [username]
     );
-    if (!result.rows || result.rows.length === 0) return res.json({ success: false, message: "Invalid credentials" });
+    if (!result.rows || result.rows.length === 0) {
+      // record failed attempt for unknown username too
+      recordFailedAttempt(key);
+      return res.json({ success: false, message: "Invalid credentials" });
+    }
 
     const user = result.rows[0];
     const stored = String(user.password || "");
-
     let ok = false;
     if (stored.startsWith("$2")) {
       ok = bcrypt.compareSync(password, stored);
@@ -229,11 +292,17 @@ app.post("/login", async (req, res) => {
       ok = password === stored;
     }
 
-    if (!ok) return res.json({ success: false, message: "Invalid credentials" });
+    if (!ok) {
+      recordFailedAttempt(key);
+      return res.json({ success: false, message: "Invalid credentials" });
+    }
 
+    // success -> reset attempts
+    resetAttempts(key);
     return res.json({ success: true, id: user.id, username: user.username, role: user.role });
   } catch (err) {
     console.error("❌ Login query error:", err);
+    // Note: do not call recordFailedAttempt on DB error
     return res.status(500).json({ success: false, message: "Database error", error: err.message, detail: err.stack?.split("\n")[0] });
   }
 });
@@ -2170,12 +2239,30 @@ app.post("/login-pin", async (req, res) => {
   try {
     const { pin } = req.body || {};
     if (!pin) return res.status(400).json({ success: false, message: "PIN required" });
-    const q = await pool.query("SELECT id, username, role FROM users WHERE COALESCE(pin,'') = $1 LIMIT 1", [String(pin)]);
-    if (!q.rows || q.rows.length === 0) return res.status(401).json({ success: false, message: "Invalid PIN" });
-    return res.json({ success: true, id: q.rows[0].id, username: q.rows[0].username, role: q.rows[0].role });
+
+    const key = loginKeyFromReq(req);
+    const lock = isLocked(key);
+    if (lock.locked) {
+      const secs = Math.ceil(lock.remainingMs / 1000);
+      return res.status(429).json({ success: false, message: `Too many attempts. Try again in ${secs} seconds`});
+    }
+
+    try {
+      const q = await pool.query("SELECT id, username, role FROM users WHERE COALESCE(pin,'') = $1 LIMIT 1", [String(pin)]);
+      if (!q.rows || q.rows.length === 0) {
+        recordFailedAttempt(key);
+        return res.status(401).json({ success: false, message: "Invalid PIN" });
+      }
+      // success -> reset attempts
+      resetAttempts(key);
+      return res.json({ success: true, id: q.rows[0].id, username: q.rows[0].username, role: q.rows[0].role });
+    } catch (err) {
+      console.error("/login-pin error:", err && (err.stack || err));
+      return res.status(500).json({ success: false, message: "Server error" });
+    }
   } catch (err) {
-    console.error("/login-pin error:", err && (err.stack || err));
-    return res.status(500).json({ success: false, message: "Server error" });
+    console.error('/login-pin error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
