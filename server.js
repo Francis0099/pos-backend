@@ -760,29 +760,34 @@ app.post("/add-product", async (req, res) => {
         .json({ success: false, message: "Product name already exists" });
     }
 
-    // Validate units for provided ingredients BEFORE insert
-    if (Array.isArray(ingredients) && ingredients.length > 0) {
-      for (const ing of ingredients) {
-        // fetch ingredient definition
-        const ingRowRes = await client.query(
-          "SELECT id, unit, piece_amount, piece_unit FROM ingredients WHERE id = $1 LIMIT 1",
-          [ing.id]
-        );
-        if (ingRowRes.rows.length === 0) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({ success: false, message: `Ingredient id ${ing.id} not found` });
+    // prepare photo value to store in DB:
+    // if photo is data:uri -> decode and save file to uploads (store path), otherwise pass through
+    let photoToStore = null;
+    try {
+      if (photo != null && String(photo).startsWith('data:')) {
+        const m = String(photo).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+        if (m) {
+          const mime = m[1];
+          const b64 = m[2];
+          const ext = mime.split('/')[1] || 'jpg';
+          const fn = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${ext}`;
+          const outPath = path.join(uploadsDir, fn);
+          fs.writeFileSync(outPath, Buffer.from(b64, 'base64'));
+          photoToStore = `/uploads/${fn}`;
+          console.log('Saved uploaded product image (create) ->', outPath);
+        } else {
+          console.warn('Invalid data URI received for product photo (create)');
+          photoToStore = null;
         }
-        const ingRow = ingRowRes.rows[0];
-        const prodUnit = ing.unit ?? ingRow.unit;
-        const invUnit = ingRow.unit;
-        if (!canConvert(prodUnit, invUnit, { piece_amount: ingRow.piece_amount, piece_unit: ingRow.piece_unit })) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            success: false,
-            message: `Incompatible unit for ingredient '${ingRow.name || ing.id}': product unit '${prodUnit}' cannot convert to inventory unit '${invUnit}'`
-          });
-        }
+      } else if (photo != null && String(photo).length > 0) {
+        photoToStore = String(photo);
+      } else {
+        photoToStore = null;
       }
+    } catch (err) {
+      console.error('Failed to save uploaded image on create:', err && (err.stack || err));
+      await client.query("ROLLBACK");
+      return res.status(500).json({ success: false, message: 'Failed to store uploaded image', error: String(err && err.message || err) });
     }
 
     // Insert product
@@ -793,6 +798,10 @@ app.post("/add-product", async (req, res) => {
       [normalizedName, category, price, normalizedSku, photo ?? "", color ?? ""]
     );
     const productId = productResult.rows[0].id;
+    // If we saved a file, update the row with the stored path
+    if (photoToStore) {
+      await client.query('UPDATE products SET photo = $1 WHERE id = $2', [photoToStore, productId]);
+    }
 
     // Insert ingredients if any (store amount_unit if provided, else fallback to ingredient.unit via migration/backfill)
     if (ingredients && ingredients.length > 0) {
@@ -815,14 +824,16 @@ app.post("/add-product", async (req, res) => {
     }
 
     await client.query("COMMIT");
+    // return product id AND persisted photo path when available
     return res.json({
       success: true,
       message:
         ingredients && ingredients.length > 0
           ? "Product and ingredients added successfully"
           : "Product added without ingredients",
-      productId,
+      id: productId,
       sku: normalizedSku,
+      product: { id: productId, name: normalizedName, photo: photoToStore }
     });
   } catch (err) {
     console.error("❌ Error adding product:", err.message);
@@ -871,7 +882,7 @@ app.get("/products/:id", async (req, res) => {
 
   try {
     const result = await pool.query(
-      "SELECT id, name, category, price, sku, is_active FROM products WHERE id = $1 LIMIT 1",
+      "SELECT id, name, category, price, sku, photo, is_active FROM products WHERE id = $1 LIMIT 1",
       [id]
     );
 
@@ -886,6 +897,7 @@ app.get("/products/:id", async (req, res) => {
       category: row.category,
       price: Number(row.price ?? 0),
       sku: row.sku,
+      photo: row.photo || null,
       is_active: row.is_active,
     });
   } catch (err) {
