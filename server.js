@@ -2237,7 +2237,7 @@ app.post('/purchase-orders/:id/receive-with-admin', async (req, res) => {
 
 app.post("/login-pin", async (req, res) => {
   try {
-    const { pin } = req.body || {};
+    const { pin, password } = req.body || {};
     if (!pin) return res.status(400).json({ success: false, message: "PIN required" });
 
     const key = loginKeyFromReq(req);
@@ -2248,14 +2248,46 @@ app.post("/login-pin", async (req, res) => {
     }
 
     try {
-      const q = await pool.query("SELECT id, username, role FROM users WHERE COALESCE(pin,'') = $1 LIMIT 1", [String(pin)]);
+      const q = await pool.query("SELECT id, username, role, password FROM users WHERE COALESCE(pin,'') = $1 LIMIT 1", [String(pin)]);
       if (!q.rows || q.rows.length === 0) {
+        // invalid pin -> record attempt
         recordFailedAttempt(key);
         return res.status(401).json({ success: false, message: "Invalid PIN" });
       }
-      // success -> reset attempts
+
+      const user = q.rows[0];
+      const role = String(user.role || "").toLowerCase();
+
+      // If this PIN belongs to an admin, require password for extra security
+      if (role === "admin" || role === "superadmin") {
+        if (!password) {
+          // do not reset attempts; inform client it must supply password
+          return res.status(401).json({ success: false, message: "Password required for admin PIN" });
+        }
+        // validate provided password against stored (bcrypt or plain)
+        const stored = String(user.password || "");
+        let ok = false;
+        try {
+          if (stored.startsWith("$2")) {
+            ok = bcrypt.compareSync(String(password), stored);
+          } else {
+            ok = String(password) === stored;
+          }
+        } catch (e) {
+          ok = false;
+        }
+        if (!ok) {
+          recordFailedAttempt(key);
+          return res.status(401).json({ success: false, message: "Invalid credentials" });
+        }
+        // success -> reset attempts and return
+        resetAttempts(key);
+        return res.json({ success: true, id: user.id, username: user.username, role: user.role });
+      }
+
+      // Non-admin PIN: accept PIN-only login
       resetAttempts(key);
-      return res.json({ success: true, id: q.rows[0].id, username: q.rows[0].username, role: q.rows[0].role });
+      return res.json({ success: true, id: user.id, username: user.username, role: user.role });
     } catch (err) {
       console.error("/login-pin error:", err && (err.stack || err));
       return res.status(500).json({ success: false, message: "Server error" });
