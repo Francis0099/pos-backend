@@ -2647,7 +2647,12 @@ app.post('/superadmin/auth', verifySuperAdmin, async (req, res) => {
 
 app.get('/superadmin/list', verifySuperAdmin, async (req, res) => {
   try {
-    const r = await pool.query('SELECT id, username, role, pin, created_at FROM users ORDER BY id DESC');
+    // include active session device + expires so the admin UI can show which device (if any) holds the session
+    const r = await pool.query(
+      `SELECT id, username, role, pin, active_session_device, active_session_expires, created_at
+       FROM users
+       ORDER BY id DESC`
+    );
     return res.json({ success: true, items: r.rows });
   } catch (err) {
     console.error('/superadmin/list error:', err && (err.stack || err));
