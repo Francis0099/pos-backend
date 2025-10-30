@@ -25,7 +25,7 @@ try {
   try { require.resolve('twilio'); console.log('module: twilio installed'); }
   catch (e) { console.log('module: twilio NOT installed'); }
   try { require.resolve('nodemailer'); console.log('module: nodemailer installed'); }
-  catch (e) { console.log('module: nodemailer NOT installed'); }
+  catch (e { console.log('module: nodemailer NOT installed'); }
 } catch (e) {
   console.error('Startup module checks failed:', e && (e.stack || e));
 }
@@ -837,12 +837,18 @@ app.post("/add-product", async (req, res) => {
     }
 
     // Insert ingredients if any (store amount_unit if provided, else fallback to ingredient.unit via migration/backfill)
-    if (ingredients && ingredients.length > 0) {
-      for (const ing of ingredients) {
-        await client.query(
-          `INSERT INTO product_ingredients (product_id, ingredient_id, amount_needed, amount_unit)
-           VALUES ($1, $2, $3, $4)`,
-          [productId, ing.id, Number(ing.amount), ing.unit ?? null]
+    if (Array.isArray(ingredients) && ingredients.length > 0) {
+      for (const pi of ingredients) {
+        const ingId = Number(pi.id);
+        const amt = Number(pi.amount);
+        const unit = String(pi.unit || "");
+        const piecesPerPack = typeof pi.pack_size !== 'undefined' && pi.pack_size !== null ? Number(pi.pack_size) : null;
+
+        // Insert into product_ingredients; include pieces_per_pack column you added via migration
+        await pool.query(
+          `INSERT INTO product_ingredients (product_id, ingredient_id, amount, unit, pieces_per_pack)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [productId, ingId, amt, unit, piecesPerPack]
         );
       }
     }
@@ -2440,6 +2446,30 @@ app.get('/sse/admin', (req, res) => {
     clearInterval(hb);
     adminNotifier.removeListener(evName, listener);
   });
+});
+
+// Get product ingredients (used by AdminProductScreen)
+app.get('/products/:id/ingredients', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const sql = `
+      SELECT
+        pi.ingredient_id AS id,
+        i.name AS name,
+        pi.amount_needed AS amount,
+        COALESCE(pi.amount_unit, i.unit) AS unit,
+        pi.pieces_per_pack
+      FROM product_ingredients pi
+      JOIN ingredients i ON pi.ingredient_id = i.id
+      WHERE pi.product_id = $1
+      ORDER BY pi.id
+    `;
+    const result = await pool.query(sql, [id]);
+    return res.json({ items: result.rows || [] });
+  } catch (err) {
+    console.error('/products/:id/ingredients error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Failed to fetch product ingredients' });
+  }
 });
 
 app.post("/admin/force-logout", handleAdminForceLogout);
