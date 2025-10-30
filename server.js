@@ -47,7 +47,9 @@ app.use(cors({
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
-app.use(express.json());
+// allow larger JSON bodies so clients can send base64 images
+app.use(express.json({ limit: "12mb" }));
+app.use(express.urlencoded({ extended: true, limit: "12mb" })); // in case form-encoded data is used
 
 // serve uploaded files (ensure folder exists)
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -766,6 +768,18 @@ app.get("/products/:id", async (req, res) => {
 app.put("/products/:id", async (req, res) => {
   const { id } = req.params;
   const { name, category, price, photo } = req.body; // accept optional photo
+
+  // debug: log incoming sizes to help diagnose failures
+  try {
+    console.log(`PUT /products/${id} payload: name=${String(name)?.slice(0,80)}, category=${String(category)?.slice(0,80)}, price=${price}`);
+    if (photo != null) {
+      console.log(` -> photo present, type=${typeof photo}, approx length=${String(photo).length}`);
+    } else {
+      console.log(" -> no photo provided");
+    }
+  } catch (logErr) {
+    console.warn("Failed printing debug info for PUT /products/:id", logErr);
+  }
 
   if (!name || !category || price === undefined || price === null) {
     return res.status(400).json({ success: false, message: "Missing required fields" });
