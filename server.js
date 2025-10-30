@@ -294,7 +294,7 @@ app.post("/login", async (req, res) => {
 
     if (!result.rows || result.rows.length === 0) {
       recordFailedAttempt(key);
-      return res.json({ success: false, message: "Invalid credentials" });
+      return res.status(401).json({ success: false, message: "Invalid credentials" });
     }
 
     const user = result.rows[0];
@@ -309,7 +309,7 @@ app.post("/login", async (req, res) => {
 
     if (!ok) {
       recordFailedAttempt(key);
-      return res.json({ success: false, message: "Invalid credentials" });
+      return res.status(401).json({ success: false, message: "Invalid credentials" });
     }
 
     // ✅ success: reset attempts
@@ -1293,7 +1293,6 @@ app.post('/categories', async (req, res) => {
   }
 });
 
-
 // ✅ Update category
 app.put('/categories/:id', async (req, res) => {
   const { id } = req.params;
@@ -1875,7 +1874,8 @@ app.post("/refund-sale", async (req, res) => {
       const alreadyRefunded = Number(refundedRes.rows[0]?.refunded ?? 0);
 
       const available = sold - alreadyRefunded;
-      if ( it.quantity > available) {
+           if ( it.quantity > available) {
+
         await client.query("ROLLBACK");
         return res.status(400).json({
           success: false,
@@ -2064,7 +2064,6 @@ app.post("/login-pin", async (req, res) => {
     try {
       const q = await pool.query("SELECT id, username, role, password FROM users WHERE COALESCE(pin,'') = $1 LIMIT 1", [String(pin)]);
       if (!q.rows || q.rows.length === 0) {
-        // invalid pin -> record attempt
         recordFailedAttempt(key);
         return res.status(401).json({ success: false, message: "Invalid PIN" });
       }
@@ -2072,36 +2071,40 @@ app.post("/login-pin", async (req, res) => {
       const user = q.rows[0];
       const role = String(user.role || "").toLowerCase();
 
-      // If this PIN belongs to an admin, require password for extra security
+      // require password for admin / superadmin PINs
       if (role === "admin" || role === "superadmin") {
         if (!password) {
-          // do not reset attempts; inform client it must supply password
           return res.status(401).json({ success: false, message: "Password required for admin PIN" });
         }
-        // validate provided password against stored (bcrypt or plain)
         const stored = String(user.password || "");
         let ok = false;
         try {
-          if (stored.startsWith("$2")) {
-            ok = bcrypt.compareSync(String(password), stored);
-          } else {
-            ok = String(password) === stored;
-          }
-        } catch (e) {
-          ok = false;
-        }
+          if (stored.startsWith("$2")) ok = bcrypt.compareSync(String(password), stored);
+          else ok = String(password) === stored;
+        } catch (e) { ok = false; }
         if (!ok) {
           recordFailedAttempt(key);
           return res.status(401).json({ success: false, message: "Invalid credentials" });
         }
-        // success -> reset attempts and return
-        resetAttempts(key);
-        return res.json({ success: true, id: user.id, username: user.username, role: user.role });
+        // ok -> fallthrough to session creation
       }
 
-      // Non-admin PIN: accept PIN-only login
+      // success for admin or non-admin: reset attempts and create/update a session (persist active_session_device)
       resetAttempts(key);
-      return res.json({ success: true, id: user.id, username: user.username, role: user.role });
+
+      const deviceId = req.body && req.body.device_id ? String(req.body.device_id) : null;
+      const session = await createOrUpdateSession(user.id, deviceId);
+
+      // respond with user + session info so client can persist token and device
+      return res.json({
+        success: true,
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        sessionToken: session.token,
+        sessionExpires: session.expires,
+        active_session_device: deviceId ?? null
+      });
     } catch (err) {
       console.error("/login-pin error:", err && (err.stack || err));
       return res.status(500).json({ success: false, message: "Server error" });
