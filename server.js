@@ -25,7 +25,7 @@ try {
   try { require.resolve('twilio'); console.log('module: twilio installed'); }
   catch (e) { console.log('module: twilio NOT installed'); }
   try { require.resolve('nodemailer'); console.log('module: nodemailer installed'); }
-  catch (e { console.log('module: nodemailer NOT installed'); }
+  catch (e) { console.log('module: nodemailer NOT installed'); }
 } catch (e) {
   console.error('Startup module checks failed:', e && (e.stack || e));
 }
