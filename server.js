@@ -1840,6 +1840,10 @@ app.post("/refund-sale", async (req, res) => {
 
 
 
+
+
+
+
     // if items not provided, build from sale_items (full-sale refund)
     let itemsToRefund = Array.isArray(items) && items.length ? items.map(i => ({ productId: Number(i.productId || i.id), quantity: Number(i.quantity || i.qty || 0) })) : [];
     if (itemsToRefund.length === 0) {
@@ -2380,6 +2384,22 @@ app.post("/admin/session-keepalive", async (req, res) => {
     return res.json({ success: true, expires: newExpires });
   } catch (err) {
     console.error("/admin/session-keepalive error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ADMIN: force clear session (requires ADMIN_KEY in env)
+app.post("/admin/force-logout", async (req, res) => {
+  try {
+    const { userId, adminKey } = req.body || {};
+    if (!process.env.ADMIN_KEY) return res.status(500).json({ success: false, message: "ADMIN_KEY not configured" });
+    if (String(adminKey || "") !== String(process.env.ADMIN_KEY)) return res.status(401).json({ success: false, message: "Forbidden" });
+    if (!userId) return res.status(400).json({ success: false, message: "userId required" });
+    await clearSessionForUser(userId);
+    console.log(`ADMIN_FORCE_LOGOUT: cleared session for user ${userId} via admin key`);
+    return res.json({ success: true, message: "Session cleared" });
+  } catch (err) {
+    console.error("/admin/force-logout error:", err && (err.stack || err));
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });
