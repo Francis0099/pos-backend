@@ -2592,6 +2592,16 @@ app.post('/superadmin/update', verifySuperAdmin, async (req, res) => {
   }
 });
 
+// superadmin auth check (returns 200 if headers/body pass verifySuperAdmin)
+app.post('/superadmin/auth', verifySuperAdmin, async (req, res) => {
+  try {
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('/superadmin/auth error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
   console.log('Provider availability:', {
