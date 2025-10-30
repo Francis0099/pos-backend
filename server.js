@@ -259,22 +259,35 @@ app.post('/submit-order', async (req, res) => {
     const TAX_INCLUSIVE = String(process.env.TAX_INCLUSIVE || 'false').toLowerCase() === 'true';
     const round2 = (v) => Math.round(Number(v || 0) * 100) / 100;
 
+    // Accept an explicit gross/total amount from client (preferred) so we don't
+    // accidentally add VAT again. Client may send `totalAmount` | `total_with_vat` | `totalWithVat`.
+    const clientGross = Number(req.body?.totalAmount ?? req.body?.total_with_vat ?? req.body?.totalWithVat ?? NaN);
+
     // compute subtotal (client may send inclusive price total or net)
     // `subtotal` variable should be the number passed from client (the visible/entered amount)
-    let subtotalNet = Number(clientSubtotal || 0);
+    let subtotalNet = 0;
     let taxAmount = 0;
     let totalAmount = 0;
 
-    if (TAX_INCLUSIVE) {
-      // client subtotal includes tax -> extract net and tax portion
-      totalAmount = round2(subtotalNet);
-      subtotalNet = round2(subtotalNet / (1 + TAX_RATE));
+    if (Number.isFinite(clientGross)) {
+      // Client explicitly provided gross total (inclusive of VAT) — trust it and extract net & tax
+      totalAmount = round2(clientGross);
+      subtotalNet = round2(totalAmount / (1 + TAX_RATE));
       taxAmount = round2(totalAmount - subtotalNet);
     } else {
-      // client subtotal is net -> compute tax on top
-      subtotalNet = round2(subtotalNet);
-      taxAmount = round2(subtotalNet * TAX_RATE);
-      totalAmount = round2(subtotalNet + taxAmount);
+      // Fall back to the older behaviour that depended on TAX_INCLUSIVE + clientSubtotal
+      subtotalNet = Number(clientSubtotal || 0);
+      if (TAX_INCLUSIVE) {
+        // client subtotal includes tax -> extract net and tax portion
+        totalAmount = round2(subtotalNet);
+        subtotalNet = round2(subtotalNet / (1 + TAX_RATE));
+        taxAmount = round2(totalAmount - subtotalNet);
+      } else {
+        // client subtotal is net -> compute tax on top
+        subtotalNet = round2(subtotalNet);
+        taxAmount = round2(subtotalNet * TAX_RATE);
+        totalAmount = round2(subtotalNet + taxAmount);
+      }
     }
 
     // begin transaction and persist sale + items and record ingredient usage
