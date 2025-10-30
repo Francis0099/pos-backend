@@ -175,6 +175,7 @@ app.get("/products-with-stock", async (req, res) => {
            pi.amount_unit,
            i.unit AS ingredient_unit,
            i.stock AS ingredient_stock,
+           i.pieces_per_pack,
            i.piece_amount,
            i.piece_unit
          FROM product_ingredients pi
@@ -461,7 +462,7 @@ app.post('/submit-order', async (req, res) => {
       // fetch product ingredients and ingredient inventory metadata
       const ingrSql = `
         SELECT pi.ingredient_id, pi.amount_needed, COALESCE(pi.amount_unit, i.unit) AS product_unit,
-               i.unit AS inventory_unit, i.piece_amount, i.piece_unit
+               i.unit AS inventory_unit, i.pieces_per_pack, i.piece_amount, i.piece_unit
         FROM product_ingredients pi
         JOIN ingredients i ON pi.ingredient_id = i.id
         WHERE pi.product_id = $1
@@ -535,6 +536,7 @@ async function computeProductStock(productId, clientOrPool = pool) {
        pi.amount_unit,
        i.stock AS ingredient_stock,
        i.unit AS ingredient_unit,
+       i.pieces_per_pack,
        i.piece_amount,
        i.piece_unit
      FROM product_ingredients pi
@@ -719,35 +721,51 @@ function canConvert(productUnit, inventoryUnit, ingredientRow = {}) {
 
 // ---------------------- add helper: inventory -> product units ----------------------
 function convertInventoryToProductUnits(inventoryAmount, inventoryUnit, productUnit, ingredientRow = {}) {
-  // try direct convert inventory -> product unit
-  const direct = convertSimple(inventoryAmount, inventoryUnit, productUnit);
-  if (!Number.isNaN(direct)) return direct;
-
-  const invU = normUnit(inventoryUnit);
-  const prodU = normUnit(productUnit);
-
-  const pieceAmount = ingredientRow && ingredientRow.piece_amount != null ? Number(ingredientRow.piece_amount) : null;
-  const pieceUnit = ingredientRow && ingredientRow.piece_unit ? String(ingredientRow.piece_unit) : null;
-
-  // inventory is pieces and product expects mass/volume: each piece -> pieceAmount (pieceUnit) -> convert pieceUnit -> productUnit
-  if (invU === "piece" && pieceAmount && pieceUnit) {
-    const perPieceInProd = convertSimple(pieceAmount, pieceUnit, productUnit);
-    if (!Number.isNaN(perPieceInProd)) {
-      return Number(inventoryAmount) * perPieceInProd;
-    }
-  }
-
-  // inventory is mass/volume and product expects pieces: number of pieces available = inventoryAmount / (perPiece in inventoryUnit)
-  if (prodU === "piece" && pieceAmount && pieceUnit) {
-    const perPieceInInv = convertSimple(pieceAmount, pieceUnit, inventoryUnit);
-    if (!Number.isNaN(perPieceInInv) && perPieceInInv > 0) {
-      return Number(inventoryAmount) / perPieceInInv;
-    }
-  }
-
-  // otherwise conversion not possible
-  return NaN;
-}
+     // try direct convert inventory -> product unit
+     const direct = convertSimple(inventoryAmount, inventoryUnit, productUnit);
+     if (!Number.isNaN(direct)) return direct;
+ 
+     const invU = normUnit(inventoryUnit);
+     const prodU = normUnit(productUnit);
+ 
+     const pieceAmount = ingredientRow && ingredientRow.piece_amount != null ? Number(ingredientRow.piece_amount) : null;
+     const pieceUnit = ingredientRow && ingredientRow.piece_unit ? String(ingredientRow.piece_unit) : null;
+     const piecesPerPack = ingredientRow && ingredientRow.pieces_per_pack != null ? Number(ingredientRow.pieces_per_pack) : null;
+ 
+   // inventory is pieces and product expects mass/volume: each piece -> pieceAmount (pieceUnit) -> convert pieceUnit -> productUnit
+   if (invU === "piece" && pieceAmount && pieceUnit) {
+     const perPieceInProd = convertSimple(pieceAmount, pieceUnit, productUnit);
+     if (!Number.isNaN(perPieceInProd)) {
+       return Number(inventoryAmount) * perPieceInProd;
+     }
+   }
+ 
+   // inventory is packs -> expand to pieces or to product units using piecesPerPack and pieceAmount
+   if (invU === "pack") {
+     // pack -> pieces
+     if (prodU === "piece") {
+       if (!piecesPerPack || !Number.isFinite(piecesPerPack) || piecesPerPack <= 0) return NaN;
+       return Number(inventoryAmount) * piecesPerPack;
+     }
+     // pack -> mass/volume: need per-piece mass/volume and piecesPerPack
+     if ((prodU === "g" || prodU === "kg" || prodU === "ml" || prodU === "l") && pieceAmount && pieceUnit && piecesPerPack) {
+       const perPieceInProd = convertSimple(pieceAmount, pieceUnit, productUnit);
+       if (Number.isNaN(perPieceInProd)) return NaN;
+       return Number(inventoryAmount) * piecesPerPack * perPieceInProd;
+     }
+   }
+ 
+   // inventory is mass/volume and product expects pieces: number of pieces available = inventoryAmount / (perPiece in inventoryUnit)
+   if (prodU === "piece" && pieceAmount && pieceUnit) {
+     const perPieceInInv = convertSimple(pieceAmount, pieceUnit, inventoryUnit);
+     if (!Number.isNaN(perPieceInInv) && perPieceInInv > 0) {
+       return Number(inventoryAmount) / perPieceInInv;
+     }
+   }
+ 
+   // otherwise conversion not possible
+   return NaN;
+ }
 app.post("/add-product", async (req, res) => {
   const { name, category, price, sku, photo, color, ingredients } = req.body;
 
@@ -1042,9 +1060,6 @@ app.get('/ingredients', async (req, res) => {
   const sql = `
     SELECT 
       i.id, i.name, i.stock, i.unit,
-      i.pieces_per_pack,
-      i.piece_amount,
-      i.piece_unit,
       COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
       COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
     FROM ingredients i;
@@ -1814,6 +1829,7 @@ app.get('/dashboard-summary', async (req, res) => {
     // Best seller today
     const bestResult = await pool.query(`
       SELECT p.id, p.name, SUM(si.quantity) AS total_sold
+
       FROM sale_items si
       JOIN sales s ON s.id = si.sale_id
       JOIN products p ON p.id = si.product_id
@@ -1971,7 +1987,7 @@ app.post("/refund-sale", async (req, res) => {
       // restore ingredient stock only when restock is truthy
       if (restock) {
         const ingrRes = await client.query(
-          `SELECT pi.ingredient_id, pi.amount_needed, pi.amount_unit, i.unit AS ingredient_unit, i.piece_amount, i.piece_unit
+          `SELECT pi.ingredient_id, pi.amount_needed, pi.amount_unit, i.unit AS ingredient_unit, i.pieces_per_pack, i.piece_amount, i.piece_unit
            FROM product_ingredients pi
            JOIN ingredients i ON pi.ingredient_id = i.id
            WHERE pi.product_id = $1`,
@@ -2352,13 +2368,21 @@ app.get('/products-split-stock', async (req, res) => {
 
     const out = [];
     for (const p of products) {
-      const ingrRes = await pool.query(`
-        SELECT pi.ingredient_id, pi.amount_needed, pi.amount_unit,
-               i.unit AS ingredient_unit, i.stock AS ingredient_stock, i.piece_amount, i.piece_unit
-        FROM product_ingredients pi
-        JOIN ingredients i ON pi.ingredient_id = i.id
-        WHERE pi.product_id = $1
-      `, [p.id]);
+      const ingrRes = await pool.query(
+        `SELECT
+           pi.ingredient_id,
+           pi.amount_needed,
+           pi.amount_unit,
+           i.unit AS ingredient_unit,
+           i.stock AS ingredient_stock,
+           i.pieces_per_pack,
+           i.piece_amount,
+           i.piece_unit
+         FROM product_ingredients pi
+         JOIN ingredients i ON pi.ingredient_id = i.id
+         WHERE pi.product_id = $1`,
+        [p.id]
+      );
 
       const counts = [];
       for (const r of (ingrRes.rows || [])) {
