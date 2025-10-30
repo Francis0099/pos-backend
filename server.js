@@ -35,6 +35,12 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { Pool } = require("pg");
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+// serve uploaded files
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+app.use('/uploads', express.static(uploadsDir));
 
 const app = express();
 app.use(cors({
@@ -752,7 +758,7 @@ app.get("/products/:id", async (req, res) => {
   }
 });
 
-// ✅ Update product basic fields (name, category, price)
+// replace existing PUT /products/:id handler with this
 app.put("/products/:id", async (req, res) => {
   const { id } = req.params;
   const { name, category, price, photo } = req.body; // accept optional photo
@@ -767,6 +773,39 @@ app.put("/products/:id", async (req, res) => {
     return res.status(400).json({ success: false, message: "Invalid price" });
   }
 
+  // prepare photo value to store in DB:
+  // - if photo is a data:uri -> decode and save file, store /uploads/<file>
+  // - otherwise pass through (null or remote URL) so DB receives short value
+  let photoToStore = null;
+  try {
+    if (photo != null && String(photo).startsWith('data:')) {
+      const m = String(photo).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+      if (m) {
+        const mime = m[1];
+        const b64 = m[2];
+        const ext = mime.split('/')[1] || 'jpg';
+        const fn = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${ext}`;
+        const outPath = path.join(uploadsDir, fn);
+        fs.writeFileSync(outPath, Buffer.from(b64, 'base64'));
+        // store a public URL path
+        photoToStore = `/uploads/${fn}`;
+        console.log('Saved uploaded product image ->', outPath);
+      } else {
+        console.warn('Invalid data URI received for product photo');
+        photoToStore = null;
+      }
+    } else if (photo != null) {
+      // accept string URL or short path
+      photoToStore = String(photo);
+    } else {
+      photoToStore = null;
+    }
+  } catch (err) {
+    console.error('Failed to save uploaded image:', err && (err.stack || err));
+    // fail early rather than writing weird DB values
+    return res.status(500).json({ success: false, message: 'Failed to store uploaded image', error: String(err && err.message || err) });
+  }
+
   try {
     const sql = `
       UPDATE products
@@ -774,7 +813,7 @@ app.put("/products/:id", async (req, res) => {
       WHERE id = $5
       RETURNING id, name, category, price, sku, photo, is_active
     `;
-    const result = await pool.query(sql, [normalizedName, category, numericPrice, (photo ?? null), id]);
+    const result = await pool.query(sql, [normalizedName, category, numericPrice, (photoToStore ?? null), id]);
 
     if (result.rowCount === 0) {
       return res.status(404).json({ success: false, message: "Product not found" });
@@ -782,7 +821,7 @@ app.put("/products/:id", async (req, res) => {
 
     return res.json({ success: true, product: result.rows[0] });
   } catch (err) {
-    console.error("❌ Error updating product:", err && (err.message || err));
+    console.error("❌ Error updating product:", err && (err.stack || err));
     return res.status(500).json({ success: false, message: "Database error", error: String(err && err.message || err) });
   }
 });
