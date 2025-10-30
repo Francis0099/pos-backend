@@ -2357,8 +2357,10 @@ async function verifyAdminSession(req, res, next) {
 // Insert verifySuperAdmin here
 function verifySuperAdmin(req, res, next) {
   try {
-    const name = req.body?.username || req.headers['x-super-username'];
-    const key = req.body?.adminKey || req.headers['x-admin-key'];
+    // Prefer header credentials so client can send the target username in the body
+    // (some client requests include a `username` for the target user).
+    const name = req.headers['x-super-username'] || req.body?.username;
+    const key = req.headers['x-admin-key'] || req.body?.adminKey;
     if (String(name) !== 'superadmin') return res.status(401).json({ success: false, message: 'Forbidden' });
     if (!process.env.ADMIN_KEY) return res.status(500).json({ success: false, message: 'ADMIN_KEY not configured' });
     if (String(key) !== String(process.env.ADMIN_KEY)) return res.status(401).json({ success: false, message: 'Forbidden' });
