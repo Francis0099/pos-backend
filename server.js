@@ -37,18 +37,22 @@ const { Pool } = require("pg");
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-// serve uploaded files
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
-app.use('/uploads', express.static(uploadsDir));
 
+// create app FIRST
 const app = express();
+
+// middleware
 app.use(cors({
-  origin: "*", 
+  origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 app.use(express.json());
+
+// serve uploaded files (ensure folder exists)
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+app.use('/uploads', express.static(uploadsDir));
 
 // Health check
 app.get('/health', (_req, res) => res.json({ ok: true }));
