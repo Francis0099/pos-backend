@@ -1934,259 +1934,42 @@ app.post("/refund-sale", async (req, res) => {
     return res.json({ success: true, refundId, restocked: !!restock });
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("❌ /refund-sale error:", err && (err.message || err));
+    console.error('❌ /refund-sale error:', err && (err.stack || err));
     return res.status(500).json({ success: false, message: "Refund failed", error: String(err && err.message || err) });
   } finally {
     client.release();
   }
 });
 
-// replace existing app.put('/purchase-orders/:id/receive', ...) handler with this
-app.put('/purchase-orders/:id/receive', async (req, res) => {
-  const { id } = req.params;
-  const client = await pool.connect();
+// helper: accept admin key from header or body
+function adminKeyFromReq(req) {
+  const bodyKey = (req.body && req.body.adminKey) ? String(req.body.adminKey) : null;
+  const headerKey = req.headers['x-admin-key'] ? String(req.headers['x-admin-key']) : null;
+  return headerKey || bodyKey || null;
+}
+
+// unified force-logout handler (used by two routes)
+async function handleAdminForceLogout(req, res) {
   try {
-    await client.query('BEGIN');
+    const userId = Number(req.body?.userId ?? req.body?.id ?? req.query?.userId);
+    const providedKey = adminKeyFromReq(req);
+    if (!process.env.ADMIN_KEY) return res.status(500).json({ success: false, message: "ADMIN_KEY not configured" });
+    if (String(providedKey || "") !== String(process.env.ADMIN_KEY)) return res.status(401).json({ success: false, message: "Forbidden" });
+    if (!userId) return res.status(400).json({ success: false, message: "userId required" });
 
-    // lock PO
-    const poRes = await client.query('SELECT * FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
-    if (poRes.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ success: false, message: 'Purchase order not found' });
-    }
-
-    // load items (schema uses po_id)
-    const itemsRes = await client.query('SELECT * FROM purchase_order_items WHERE po_id = $1', [id]);
-    const items = itemsRes.rows || [];
-
-    // update stock and record additions using your schema: (ingredient_id, amount, date, source)
-    for (const it of items) {
-      const qty = Number(it.qty || 0);
-      // update ingredient stock
-      await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [qty, it.ingredient_id]);
-
-      // insert addition record
-      await client.query(
-        `INSERT INTO ingredient_additions (ingredient_id, amount, date, source)
-         VALUES ($1, $2, NOW(), $3)`,
-        [it.ingredient_id, qty, `PO:${id}`]
-      );
-    }
-
-    // mark PO received
-    // updated_at column may not exist in your schema — update only status to avoid SQL error
-    await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2', ['received', id]);
-
-    await client.query('COMMIT');
-    return res.json({ success: true, message: 'PO received', id });
+    await clearSessionForUser(userId);
+    try { adminNotifier.emit(`force-logout:${userId}`, { userId }); } catch (e) {}
+    console.log(`ADMIN_FORCE_LOGOUT: cleared session for user ${userId} via admin key/header`);
+    return res.json({ success: true, message: "Session cleared" });
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('receive PO error', err);
-    return res.status(500).json({ success: false, message: 'Server error', error: String(err.message) });
-  } finally {
-    client.release();
+    console.error("/admin/force-logout error:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Server error" });
   }
-});
+}
 
-// Cancel a PO
-app.put('/purchase-orders/:id/cancel', async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
-  try {
-    const q = await dbQuery(`UPDATE purchase_orders SET status = 'cancelled' WHERE id = $1 RETURNING id`, [id]);
-    if (!q || q.length === 0) return res.status(404).json({ success: false, message: 'Not found' });
-    return res.json({ success: true });
-  } catch (err) {
-    console.error('cancel po', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-// List purchase orders (basic fields + items)
-app.get('/purchase-orders', async (req, res) => {
-  try {
-    const ordersRes = await pool.query(
-      `SELECT id, supplier_id, created_by, status, total, notes, created_at
-      
-       FROM purchase_orders
-       ORDER BY created_at DESC`
-    );
-    const orders = ordersRes.rows || [];
-
-    // load items for all orders in one query
-    const orderIds = orders.map(o => o.id);
-    let items = [];
-    if (orderIds.length > 0) {
-      const itemsRes = await pool.query(
-        `SELECT poi.*, i.name AS ingredient_name
-         FROM purchase_order_items poi
-         LEFT JOIN ingredients i ON i.id = poi.ingredient_id
-         WHERE poi.po_id = ANY($1::int[])
-         ORDER BY poi.id`,
-        [orderIds]
-      );
-      items = itemsRes.rows || [];
-    }
-
-    // attach items to their orders
-    const byOrder = {};
-    for (const it of items) {
-      const key = String(it.po_id);
-      byOrder[key] = byOrder[key] || [];
-      byOrder[key].push({
-        id: it.id,
-        ingredient_id: it.ingredient_id,
-        ingredient_name: it.ingredient_name,
-        qty: it.qty,
-        unit: it.unit,
-        unit_cost: it.unit_cost,
-        created_at: it.created_at
-      });
-    }
-
-    const out = orders.map(o => ({
-      ...o,
-      items: byOrder[String(o.id)] || []
-    }));
-
-    return res.json(out);
-  } catch (err) {
-    console.error('❌ /purchase-orders error:', err && (err.message || err));
-    return res.status(500).json({ success: false, message: 'Failed to fetch purchase orders', error: String(err && err.message || err) });
-  }
-});
-
-// Get single purchase order with items
-app.get('/purchase-orders/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-      
-       const poRes = await pool.query(
-      `SELECT id, supplier_id, created_by, status, total, notes, created_at
-       FROM purchase_orders WHERE id = $1 LIMIT 1`,
-      [id]
-    );
-    if (poRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Purchase order not found' });
-    const po = poRes.rows[0];
-
-    const itemsRes = await pool.query(
-      `SELECT poi.*, i.name AS ingredient_name
-       FROM purchase_order_items poi
-       LEFT JOIN ingredients i ON i.id = poi.ingredient_id
-       WHERE poi.po_id = $1
-       ORDER BY poi.id`,
-      [id]
-    );
-
-    po.items = (itemsRes.rows || []).map(it => ({
-      id: it.id,
-      ingredient_id: it.ingredient_id,
-      ingredient_name: it.ingredient_name,
-      qty: it.qty,
-      unit: it.unit,
-      unit_cost: it.unit_cost,
-      created_at: it.created_at
-    }));
-
-    return res.json(po);
-  } catch (err) {
-    console.error('❌ /purchase-orders/:id error:', err && (err.message || err));
-    return res.status(500).json({ success: false, message: 'Failed to fetch purchase order', error: String(err && err.message || err) });
-  }
-});
-
-// Delete a purchase order (only allowed when not received)
-app.delete('/purchase-orders/:id', async (req, res) => {
-  const { id } = req.params;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // ensure PO exists
-
-    const poRes = await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
-    if (poRes.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ success: false, message: 'Purchase order not found' });
-    }
-    const po = poRes.rows[0];
-    if (po.status === 'received') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'Cannot delete a received purchase order' });
-    }
-
-    // delete items (schema uses po_id)
-    await client.query('DELETE FROM purchase_order_items WHERE po_id = $1', [id]);
-    // delete the purchase order
-    await client.query('DELETE FROM purchase_orders WHERE id = $1', [id]);
-
-    await client.query('COMMIT');
-    return res.json({ success: true, message: 'Purchase order deleted', id });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('delete PO error', err);
-    return res.status(500).json({ success: false, message: 'Server error', error: String(err.message) });
-  } finally {
-    client.release();
-  }
-});
-
-// ✅ Create purchase order
-app.post('/purchase-orders', async (req, res) => {
-  const { supplier_id = null, items = [] } = req.body || {};
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ success: false, message: 'Items required' });
- }
-  try {
-    // --- ADDED: basic input validation ---
-    for (const it of items) {
-      const qty = Number(it.qty);
-      const cost = Number(it.unit_cost);
-      if (!Number.isFinite(qty) || qty <= 0) {
-        return res.status(400).json({ success: false, message: 'Invalid item quantity' });
-      }
-      if (!Number.isFinite(cost) || cost < 0) {
-        return res.status(400).json({ success: false, message: 'Invalid item cost' });
-      }
-    }
-
-    const client = await pool.connect();
-    await client.query('BEGIN');
-
-    // calculate total (sum qty * unit_cost) safely
-    const total = items.reduce((sum, it) => sum + (Number(it.qty || 0) * Number(it.unit_cost || 0)), 0);
-
-    const poInsert = await client.query(
-      `INSERT INTO purchase_orders (supplier_id, status, total, created_at)
-       VALUES ($1, $2, $3, NOW()) RETURNING id`,
-      [supplier_id, 'placed', total]
-    );
-    const poId = poInsert.rows[0].id;
-
-    const insertItemText =
-      `INSERT INTO purchase_order_items (po_id, ingredient_id, qty, unit, unit_cost, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())`;
-
-    for (const it of items) {
-      await client.query(insertItemText, [
-        poId,
-        Number(it.ingredient_id),
-        Number(it.qty || 0),
-        it.unit ?? null,
-        Number(it.unit_cost || 0),
-      ]);
-    }
-
-    await client.query('COMMIT');
-    return res.status(201).json({ success: true, id: poId });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('/purchase-orders POST error', err);
-    return res.status(500).json({ success: false, message: 'Server error', error: String(err?.message ?? err) });
-   } finally {
-    client.release();
-  }
-});
+// replace existing single route with two endpoints that share the handler
+app.post("/admin/force-logout", handleAdminForceLogout);
+app.post("/superadmin/force-logout", handleAdminForceLogout);
 
 // --- DISABLE OTP: do not initialize providers (safe) ---
 let twilioClient = null;
@@ -2558,25 +2341,8 @@ app.get('/sse/admin', (req, res) => {
   });
 });
 
-app.post("/admin/force-logout", async (req, res) => {
-  try {
-    const { userId, adminKey } = req.body || {};
-    if (!process.env.ADMIN_KEY) return res.status(500).json({ success: false, message: "ADMIN_KEY not configured" });
-    if (String(adminKey || "") !== String(process.env.ADMIN_KEY)) return res.status(401).json({ success: false, message: "Forbidden" });
-    if (!userId) return res.status(400).json({ success: false, message: "userId required" });
-
-    await clearSessionForUser(userId);
-
-    // notify any SSE subscribers for that user
-    try { adminNotifier.emit(`force-logout:${userId}`, { userId }); } catch (e) {}
-
-    console.log(`ADMIN_FORCE_LOGOUT: cleared session for user ${userId} via admin key`);
-    return res.json({ success: true, message: "Session cleared" });
-  } catch (err) {
-    console.error("/admin/force-logout error:", err && (err.stack || err));
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
-});
+app.post("/admin/force-logout", handleAdminForceLogout);
+app.post("/superadmin/force-logout", handleAdminForceLogout);
 
 app.post('/superadmin/create', verifySuperAdmin, async (req, res) => {
   try {
