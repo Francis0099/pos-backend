@@ -98,7 +98,14 @@ function resetAttempts(key) {
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+   allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-admin-key",
+    "x-super-username",
+    "x-admin-token",
+    "x-user-id"
+  ]
 }));
 // allow larger JSON bodies so clients can send base64 images
 app.use(express.json({ limit: "12mb" }));
@@ -1834,7 +1841,7 @@ app.post("/refund-sale", async (req, res) => {
       const alreadyRefunded = Number(refundedRes.rows[0]?.refunded ?? 0);
 
       const available = sold - alreadyRefunded;
-      if (it.quantity > available) {
+      if ( it.quantity > available) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           success: false,
@@ -2347,6 +2354,21 @@ async function verifyAdminSession(req, res, next) {
   }
 }
 
+// Insert verifySuperAdmin here
+function verifySuperAdmin(req, res, next) {
+  try {
+    const name = req.body?.username || req.headers['x-super-username'];
+    const key = req.body?.adminKey || req.headers['x-admin-key'];
+    if (String(name) !== 'superadmin') return res.status(401).json({ success: false, message: 'Forbidden' });
+    if (!process.env.ADMIN_KEY) return res.status(500).json({ success: false, message: 'ADMIN_KEY not configured' });
+    if (String(key) !== String(process.env.ADMIN_KEY)) return res.status(401).json({ success: false, message: 'Forbidden' });
+    return next();
+  } catch (err) {
+    console.error('verifySuperAdmin error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+}
+
 // optional simple request logger to diagnose 404s
 app.use((req, _res, next) => {
   console.log(`REQ ${req.method} ${req.path}`);
@@ -2519,8 +2541,74 @@ app.post("/admin/force-logout", async (req, res) => {
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });
-// ...existing code...
-// list users (superadmin only)
+
+app.post('/superadmin/create', verifySuperAdmin, async (req, res) => {
+  try {
+    const { username, password, pin = null, role = 'admin' } = req.body || {};
+    if (!username || !password) return res.status(400).json({ success: false, message: 'username and password required' });
+    const hash = bcrypt.hashSync(String(password), 10);
+    const r = await pool.query(
+      'INSERT INTO users (username, password, role, pin) VALUES ($1, $2, $3, $4) RETURNING id',
+      [username, hash, role, pin]
+    );
+    return res.json({ success: true, id: r.rows[0].id });
+  } catch (err) {
+    console.error('/superadmin/create error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'DB error' });
+  }
+});
+
+// delete user by id (superadmin credential required)
+app.post('/superadmin/delete', verifySuperAdmin, async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    if (!userId) return res.status(400).json({ success: false, message: 'userId required' });
+    await pool.query('DELETE FROM users WHERE id = $1', [Number(userId)]);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('/superadmin/delete error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'DB error' });
+  }
+});
+
+// update user (password and/or pin) (superadmin credential required)
+app.post('/superadmin/update', verifySuperAdmin, async (req, res) => {
+  try {
+    const { userId, password, pin } = req.body || {};
+    if (!userId) return res.status(400).json({ success: false, message: 'userId required' });
+
+    const updates = [];
+    const params = [];
+    let idx = 1;
+    if (password) {
+      updates.push(`password = $${idx++}`);
+      params.push(bcrypt.hashSync(String(password), 10));
+    }
+    if (typeof pin !== 'undefined') {
+      updates.push(`pin = $${idx++}`);
+      params.push(pin);
+    }
+    if (updates.length === 0) return res.status(400).json({ success: false, message: 'nothing to update' });
+
+    params.push(Number(userId));
+    const sql = `UPDATE users SET ${updates.join(', ')} WHERE id = $${idx}`;
+    await pool.query(sql, params);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('/superadmin/update error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'DB error' });
+  }
+});
+
+app.post('/superadmin/auth', verifySuperAdmin, async (req, res) => {
+  try {
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('/superadmin/auth error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 app.get('/superadmin/list', verifySuperAdmin, async (req, res) => {
   try {
     const r = await pool.query('SELECT id, username, role, pin, created_at FROM users ORDER BY id DESC');
@@ -2530,7 +2618,6 @@ app.get('/superadmin/list', verifySuperAdmin, async (req, res) => {
     return res.status(500).json({ success: false, message: 'DB error' });
   }
 });
-// ...existing code...
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
