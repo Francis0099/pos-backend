@@ -234,32 +234,6 @@ app.get("/products-with-stock", async (req, res) => {
   }
 });
 
-app.get("/products-all-admin", async (req, res) => {
-  try {
-    const sql = `
-      SELECT
-        p.id,
-        p.name,
-        p.price,
-        p.category,
-        p.is_active,
-        COALESCE(
-          MIN(FLOOR(i.stock / NULLIF(pi.amount_needed,0))),
-          COALESCE(p.stock,0)
-        )::int AS stock
-      FROM products p
-      LEFT JOIN product_ingredients pi ON pi.product_id = p.id
-      LEFT JOIN ingredients i ON pi.ingredient_id = i.id
-      GROUP BY p.id, p.name, p.price, p.category, p.stock, p.is_active
-      ORDER BY p.name;
-    `;
-    const result = await pool.query(sql);
-    return res.json(result.rows || []);
-  } catch (err) {
-    console.error('❌ /products-all-admin error:', err.message || err);
-    return res.status(500).json({ success: false, message: 'Database error' });
-  }
-});
 
 // Example: replace your handler SQL calls with dbQuery(...) so errors are logged with the SQL.
 app.post("/login", async (req, res) => {
@@ -1060,19 +1034,20 @@ app.put("/products/:id", async (req, res) => {
 
 // ✅ Get a product's ingredients and required amounts
 app.get('/ingredients', async (req, res) => {
-  const sql = `
-    SELECT 
-      i.id, i.name, i.stock, i.unit,
-      COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
-      COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
-    FROM ingredients i;
-  `;
   try {
+    const sql = `
+      SELECT 
+        i.id, i.name, i.stock, i.unit, i.pieces_per_pack,
+        COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
+        COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
+      FROM ingredients i
+      ORDER BY LOWER(i.name)
+    `;
     const result = await pool.query(sql);
-    res.json(result.rows);
+    return res.json(result.rows || []);
   } catch (err) {
-    console.error('DB Fetch Error:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
+    console.error('❌ /ingredients list error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
@@ -1443,44 +1418,24 @@ app.delete('/categories/:id', async (req, res) => {
   }
 });
 
-
-app.get('/ingredients', async (req, res) => {
-  const sql = `
-    SELECT 
-      i.id, i.name, i.stock, i.unit,
-      COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
-      COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
-    FROM ingredients i;
-  `;
-  try {
-    const result = await pool.query(sql);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('DB Fetch Error:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
-  }
-});
-
-
 app.get('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
-  const sql = `
-    SELECT 
-      i.id, i.name, i.stock, i.unit,
-      COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
-      COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
-    FROM ingredients i
-    WHERE i.id = $1;
-  `;
   try {
+    const sql = `
+      SELECT 
+        i.id, i.name, i.stock, i.unit, i.pieces_per_pack,
+        COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
+        COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
+      FROM ingredients i
+      WHERE i.id = $1
+      LIMIT 1
+    `;
     const result = await pool.query(sql, [id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Ingredient not found' });
-    }
-    res.json(result.rows[0]);
+    if (!result.rows || result.rows.length === 0) return res.status(404).json({ success: false, message: 'Ingredient not found' });
+    return res.json(result.rows[0]);
   } catch (err) {
-    console.error('DB Fetch Error:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
+    console.error('❌ /ingredients/:id error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
@@ -1553,7 +1508,6 @@ app.put('/ingredients/:id', async (req, res) => {
 app.delete('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    // Prevent accidental deletion if ingredient is used by any product
     const ref = await pool.query('SELECT COUNT(*)::int AS cnt FROM product_ingredients WHERE ingredient_id = $1', [id]);
     const cnt = Number(ref.rows?.[0]?.cnt ?? 0);
     if (cnt > 0) {
@@ -1562,15 +1516,12 @@ app.delete('/ingredients/:id', async (req, res) => {
         message: 'Ingredient is referenced by product recipes. Remove it from products before deleting.',
         references: { productIngredientCount: cnt }
       });
-   }
-
-    const result = await pool.query('DELETE FROM ingredients WHERE id = $1', [id]);
-    if (result.rowCount === 0) {
-      return res.status(404).json({ success: false, message: 'Ingredient not found' });
     }
+    const result = await pool.query('DELETE FROM ingredients WHERE id = $1', [id]);
+    if (result.rowCount === 0) return res.status(404).json({ success: false, message: 'Ingredient not found' });
     return res.json({ success: true, message: 'Ingredient deleted successfully' });
   } catch (err) {
-   console.error('❌ DB Delete Error:', err && (err.stack || err));
+    console.error('DB Delete Error:', err);
     return res.status(500).json({ success: false, message: 'Database error', error: String(err?.message || err) });
   }
 });
@@ -1796,55 +1747,6 @@ app.get('/ingredients/:id/additions', async (req, res) => {
   } catch (err) {
     console.error("❌ Error fetching additions:", err);
     res.status(500).json({ success: false, message: "Database error" });
-  }
-});
-
-app.get('/best-sellers', async (req, res) => {
-  try {
-    const { month, year, lastMonth, category } = req.query;
-    let target = new Date();
-    if (String(lastMonth).toLowerCase() === 'true') {
-      target.setMonth(target.getMonth() - 1);
-    }
-    const m = month ? Number(month) : (target.getMonth() + 1);
-    const y = year ? Number(year) : target.getFullYear();
-
-    // Sum sale_items minus already refunded quantities (refund_items)
-    // refunded_qty is summed per sale + product, then subtracted from sold quantity
-    let sql = `
-      SELECT
-        p.id,
-        p.name,
-        SUM( GREATEST(si.quantity - COALESCE(ri.refunded_qty,0), 0) )::int AS total_sold
-      FROM sale_items si
-      JOIN sales s ON s.id = si.sale_id
-      JOIN products p ON p.id = si.product_id
-      LEFT JOIN (
-        SELECT r.sale_id, ri.product_id, SUM(ri.quantity)::int AS refunded_qty
-        FROM refund_items ri
-        JOIN refunds r ON r.id = ri.refund_id
-        GROUP BY r.sale_id, ri.product_id
-      ) ri ON ri.sale_id = si.sale_id AND ri.product_id = si.product_id
-      WHERE EXTRACT(YEAR FROM s.created_at) = $1 AND EXTRACT(MONTH FROM s.created_at) = $2
-    `;
-    const params = [y, m];
-
-    if (category && String(category).trim()) {
-      sql += ` AND p.category = $3`;
-      params.push(String(category).trim());
-    }
-
-    sql += `
-      GROUP BY p.id, p.name
-      ORDER BY total_sold DESC
-      LIMIT 10
-    `;
-
-    const result = await pool.query(sql, params);
-    return res.json({ month: m, year: y, items: result.rows });
-  } catch (err) {
-    console.error('❌ best-sellers error:', err && (err.message) || err);
-    return res.status(500).json({ success: false, message: 'Failed to fetch best sellers' });
   }
 });
 
