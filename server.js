@@ -1761,7 +1761,8 @@ app.get('/ingredients/:id/additions', async (req, res) => {
   const { id } = req.params;
   try {
     const result = await pool.query(
-      `SELECT id, amount, source, date AS created_at
+      `SELECT id, amount, source,
+              to_char(date, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
        FROM ingredient_additions
        WHERE ingredient_id = $1
        ORDER BY date DESC`,
