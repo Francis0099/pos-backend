@@ -2222,44 +2222,107 @@ app.post("/purchase-orders/:id/receive", async (req, res) => {
     client.release();
   }
 });
+
 app.post('/purchase-orders/:id/receive-with-admin', async (req, res) => {
   const { id } = req.params;
   const { admin_password, admin_pin } = req.body || {};
+
   try {
+    // ✅ Verify admin credentials
     const admin = await authenticateAdmin({ admin_password, admin_pin });
-    if (!admin) return res.status(401).json({ success: false, message: 'Unauthorized: admin password and PIN required and must match the same admin' });
+    if (!admin) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized: admin password and PIN required and must match the same admin',
+      });
+    }
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      const poRes = await client.query('SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE', [id]);
-      if (poRes.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Purchase order not found' }); }
-      if (poRes.rows[0].status === 'received') { await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: 'Purchase order already received' }); }
+      // ✅ Lock PO row to prevent concurrent updates
+      const poRes = await client.query(
+        'SELECT id, status FROM purchase_orders WHERE id = $1 FOR UPDATE',
+        [id]
+      );
 
-      const itemsRes = await client.query('SELECT * FROM purchase_order_items WHERE po_id = $1', [id]);
-      for (const it of (itemsRes.rows || [])) {
-        const qty = Number(it.qty || 0);
-        if (qty === 0) continue;
-        await client.query('UPDATE ingredients SET stock = COALESCE(stock,0) + $1 WHERE id = $2', [qty, it.ingredient_id]);
-        await client.query(`INSERT INTO ingredient_additions (ingredient_id, amount, date, source) VALUES ($1, $2, NOW(), $3)`, [it.ingredient_id, qty, `PO:${id}`]);
+      if (poRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({
+          success: false,
+          message: 'Purchase order not found',
+        });
       }
 
-      await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2', ['received', id]);
+      if (poRes.rows[0].status === 'received') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success: false,
+          message: 'Purchase order already received',
+        });
+      }
+
+      // ✅ Fetch all items in this purchase order
+      const itemsRes = await client.query(
+        'SELECT * FROM purchase_order_items WHERE po_id = $1',
+        [id]
+      );
+
+      // ✅ For each item: increase ingredient stock + log restock
+      for (const it of itemsRes.rows || []) {
+        const qty = Number(it.qty || 0);
+        if (qty === 0) continue;
+
+        // Update stock
+        await client.query(
+          'UPDATE ingredients SET stock = COALESCE(stock, 0) + $1 WHERE id = $2',
+          [qty, it.ingredient_id]
+        );
+
+        // Log addition (NOTE: source column comes before amount/date)
+        await client.query(
+          `
+          INSERT INTO ingredient_additions (ingredient_id, source, amount, date, processed_by)
+          VALUES ($1, $2, $3, NOW(), $4)
+          `,
+          [it.ingredient_id, `PO:${id}`, qty, admin.username]
+        );
+      }
+
+      // ✅ Mark PO as received
+      await client.query(
+        'UPDATE purchase_orders SET status = $1 WHERE id = $2',
+        ['received', id]
+      );
+
       await client.query('COMMIT');
-      return res.json({ success: true, message: 'PO received', id, processedBy: admin.username });
+      return res.json({
+        success: true,
+        message: 'Purchase order successfully received',
+        id,
+        processedBy: admin.username,
+      });
     } catch (err) {
-      await client.query('ROLLBACK').catch(()=>{});
-      console.error('receive-with-admin error', err && (err.stack || err));
-      return res.status(500).json({ success: false, message: 'Server error', error: String(err?.message || err) });
+      await client.query('ROLLBACK').catch(() => {});
+      console.error('❌ receive-with-admin error:', err && (err.stack || err));
+      return res.status(500).json({
+        success: false,
+        message: 'Server error during PO receive',
+        error: String(err?.message || err),
+      });
     } finally {
       client.release();
     }
   } catch (err) {
     console.error('/purchase-orders/:id/receive-with-admin error:', err && (err.stack || err));
-    return res.status(500).json({ success: false, message: 'Server error' });
+    return res.status(500).json({
+      success: false,
+      message: 'Server error',
+    });
   }
 });
+
 
 
 app.post("/login-pin", async (req, res) => {
