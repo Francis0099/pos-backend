@@ -1713,6 +1713,25 @@ app.get("/ingredient-usage-report", async (req, res) => {
   }
 });
 
+app.get('/ingredients/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT id, name, stock, unit, pieces_per_pack, active
+       FROM ingredients
+       WHERE id = $1`,
+      [id]
+    );
+
+    if (result.rows.length === 0)
+      return res.status(404).json({ success: false, message: 'Ingredient not found' });
+
+    return res.json({ success: true, ingredient: result.rows[0] });
+  } catch (err) {
+    console.error('❌ /ingredients/:id error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
 
 app.get('/ingredients/:id/deductions', async (req, res) => {
   const { id } = req.params;
@@ -1740,19 +1759,18 @@ app.get('/ingredients/:id/deductions', async (req, res) => {
 
 app.get('/ingredients/:id/additions', async (req, res) => {
   const { id } = req.params;
-  const sql = `
-    SELECT created_at AS date, source, amount
-    FROM ingredient_additions
-    WHERE ingredient_id = $1
-    ORDER BY created_at DESC
-  `;
-
   try {
-    const result = await pool.query(sql, [id]);
-    res.json(result.rows || []);
+    const result = await pool.query(
+      `SELECT id, amount, source, created_at
+       FROM ingredient_additions
+       WHERE ingredient_id = $1
+       ORDER BY created_at DESC`,
+      [id]
+    );
+    res.json({ success: true, additions: result.rows });
   } catch (err) {
-       console.error("❌ Error fetching additions:", err);
-    res.status(500).json({ success: false, message: "Database error" });
+    console.error('❌ fetchAdditions error:', err);
+    res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
