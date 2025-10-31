@@ -1508,20 +1508,41 @@ app.put('/ingredients/:id', async (req, res) => {
 app.delete('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    const ref = await pool.query('SELECT COUNT(*)::int AS cnt FROM product_ingredients WHERE ingredient_id = $1', [id]);
-    const cnt = Number(ref.rows?.[0]?.cnt ?? 0);
-    if (cnt > 0) {
-      return res.status(409).json({
-        success: false,
-        message: 'Ingredient is referenced by product recipes. Remove it from products before deleting.',
-        references: { productIngredientCount: cnt }
+    // check common referencing tables
+    const checks = {
+      product_ingredients: `SELECT COUNT(*)::int AS cnt FROM product_ingredients WHERE ingredient_id = $1`,
+      purchase_order_items: `SELECT COUNT(*)::int AS cnt FROM purchase_order_items WHERE ingredient_id = $1`,
+      ingredient_usage: `SELECT COUNT(*)::int AS cnt FROM ingredient_usage WHERE ingredient_id = $1`,
+      ingredient_additions: `SELECT COUNT(*)::int AS cnt FROM ingredient_additions WHERE ingredient_id = $1`,
+      refund_items: `SELECT COUNT(*)::int AS cnt FROM refund_items WHERE ingredient_id = $1`
+    };
+
+    const refCounts = {};
+    for (const [tbl, q] of Object.entries(checks)) {
+      const r = await pool.query(q, [id]);
+      refCounts[tbl] = Number(r.rows?.[0]?.cnt ?? 0);
+    }
+    const totalRefs = Object.values(refCounts).reduce((a,b) => a + b, 0);
+
+    if (totalRefs > 0) {
+      // Soft-delete: mark as inactive / archived so PO history stays intact
+      await pool.query(`ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS active boolean DEFAULT true`);
+      await pool.query(`UPDATE ingredients SET active = false WHERE id = $1`, [id]);
+
+      return res.status(200).json({
+        success: true,
+        archived: true,
+        message: 'Ingredient archived because it is referenced by other records. History preserved.',
+        references: refCounts
       });
     }
+
+    // no references -> safe to delete
     const result = await pool.query('DELETE FROM ingredients WHERE id = $1', [id]);
     if (result.rowCount === 0) return res.status(404).json({ success: false, message: 'Ingredient not found' });
     return res.json({ success: true, message: 'Ingredient deleted successfully' });
   } catch (err) {
-    console.error('DB Delete Error:', err);
+    console.error('DB Delete Error:', err && (err.stack || err));
     return res.status(500).json({ success: false, message: 'Database error', error: String(err?.message || err) });
   }
 });
