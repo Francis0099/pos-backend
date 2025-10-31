@@ -2165,7 +2165,63 @@ app.post("/purchase-orders", async (req, res) => {
     client.release();
   }
 });
+app.post("/purchase-orders/:id/receive", async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
 
+  try {
+    await client.query("BEGIN");
+
+    // Get PO items
+    const itemsRes = await client.query(
+      `SELECT ingredient_id, qty, unit
+       FROM purchase_order_items
+       WHERE po_id = $1`,
+      [id]
+    );
+
+    if (itemsRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "No items found for this purchase order" });
+    }
+
+    // Loop through items and update stock + log additions
+    for (const item of itemsRes.rows) {
+      const ingredientId = Number(item.ingredient_id);
+      const qty = Number(item.qty);
+
+      // Update ingredient stock
+      await client.query(
+        `UPDATE ingredients
+         SET stock = COALESCE(stock, 0) + $1
+         WHERE id = $2`,
+        [qty, ingredientId]
+      );
+
+      // Log restock in ingredient_additions
+      await client.query(
+        `INSERT INTO ingredient_additions (ingredient_id, amount, source, date)
+         VALUES ($1, $2, $3, NOW())`,
+        [ingredientId, qty, `PO#${id}`]
+      );
+    }
+
+    // Update PO status
+    await client.query(
+      `UPDATE purchase_orders SET status = 'received' WHERE id = $1`,
+      [id]
+    );
+
+    await client.query("COMMIT");
+    res.json({ success: true, message: "Purchase order received and stock updated" });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ /purchase-orders/:id/receive error:", err.stack || err);
+    res.status(500).json({ success: false, message: "Database error", error: err.message });
+  } finally {
+    client.release();
+  }
+});
 app.post('/purchase-orders/:id/receive-with-admin', async (req, res) => {
   const { id } = req.params;
   const { admin_password, admin_pin } = req.body || {};
