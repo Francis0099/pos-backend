@@ -1105,7 +1105,7 @@ app.put("/products/:id/ingredients", async (req, res) => {
     if (ingredients.length > 0) {
       const ids = ingredients.map((x) => Number(x.ingredientId));
       const ingrRes = await client.query(
-        `SELECT id, name, unit, piece_amount, piece_unit FROM ingredients WHERE id = ANY($1)`,
+        `SELECT id, name, unit, piece_amount, piece_unit, pieces_per_pack FROM ingredients WHERE id = ANY($1)`,
         [ids]
       );
       const byId = {};
@@ -1119,7 +1119,12 @@ app.put("/products/:id/ingredients", async (req, res) => {
         }
         const prodUnit = ing.unit ?? row.unit;
         const invUnit = row.unit;
-        if (!canConvert(prodUnit, invUnit, { piece_amount: row.piece_amount, piece_unit: row.piece_unit })) {
+        // allow per-product pieces_per_pack submitted by client to be used for conversion check
+        const piecesPerPackForCheck = typeof ing.pieces_per_pack !== 'undefined' && ing.pieces_per_pack !== null
+          ? Number(ing.pieces_per_pack)
+          : (row.pieces_per_pack != null ? Number(row.pieces_per_pack) : null);
+
+        if (!canConvert(prodUnit, invUnit, { piece_amount: row.piece_amount, piece_unit: row.piece_unit, pieces_per_pack: piecesPerPackForCheck })) {
           await client.query("ROLLBACK");
           return res.status(400).json({
             success: false,
