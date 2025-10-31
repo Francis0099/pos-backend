@@ -1761,18 +1761,19 @@ app.get('/ingredients/:id/additions', async (req, res) => {
   const { id } = req.params;
   try {
     const result = await pool.query(
-      `SELECT id, amount, source, created_at
+      `SELECT id, amount, source, date AS created_at
        FROM ingredient_additions
        WHERE ingredient_id = $1
-       ORDER BY created_at DESC`,
+       ORDER BY date DESC`,
       [id]
     );
     res.json({ success: true, additions: result.rows });
   } catch (err) {
-    console.error('❌ fetchAdditions error:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
+    console.error('❌ fetchAdditions error:', err.stack || err.message || err);
+    res.status(500).json({ success: false, message: 'Database error', error: err.message });
   }
 });
+
 
 app.get('/dashboard-summary', async (req, res) => {
   try {
