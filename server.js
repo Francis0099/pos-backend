@@ -1223,9 +1223,11 @@ app.post('/ingredients', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query(`ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS active boolean DEFAULT true`);
+
     const normalized = String(name).trim();
 
-    // find any ingredient with same name (case-insensitive, trimmed)
+    // find existing ingredient (case-insensitive)
     const found = await client.query(
       `SELECT id, active FROM ingredients WHERE LOWER(trim(name)) = LOWER(trim($1)) LIMIT 1`,
       [normalized]
@@ -1234,7 +1236,7 @@ app.post('/ingredients', async (req, res) => {
     if (found.rows.length) {
       const r = found.rows[0];
       if (!r.active) {
-        // reactivate archived record and update provided fields (unit/pieces_per_pack/stock)
+        // reactivate and update fields
         await client.query(
           `UPDATE ingredients
            SET name = $2,
@@ -1246,7 +1248,7 @@ app.post('/ingredients', async (req, res) => {
           [r.id, normalized, unit, pieces_per_pack, stock]
         );
 
-        // optionally add an ingredient_additions / initial stock record if source provided
+        // optional log
         if (stock !== null) {
           try {
             await client.query(
@@ -1255,7 +1257,6 @@ app.post('/ingredients', async (req, res) => {
               [r.id, stock, source || 'reactivate']
             );
           } catch (e) {
-            // non-fatal if table doesn't exist
             console.warn('ingredient_additions insert skipped:', e?.message || e);
           }
         }
@@ -1264,21 +1265,22 @@ app.post('/ingredients', async (req, res) => {
         return res.json({ success: true, id: r.id, reactivated: true, message: 'Ingredient reactivated' });
       }
 
-      // already active -> conflict
       await client.query('ROLLBACK');
       return res.status(409).json({ success: false, message: 'Ingredient with that name already exists' });
     }
 
-    // insert new
+    // insert new ingredient
     const ins = await client.query(
       `INSERT INTO ingredients (name, unit, pieces_per_pack, stock, active)
-       VALUES ($1, $2, $3, COALESCE($4, 0), true) RETURNING id`,
+       VALUES ($1, $2, $3, COALESCE($4, 0), true)
+       RETURNING id, name, unit, stock, active`,
       [normalized, unit, pieces_per_pack, stock]
     );
+
     await client.query('COMMIT');
-    return res.json({ success: true, id: ins.rows[0].id });
+    return res.json({ success: true, ingredient: ins.rows[0], message: 'Ingredient created' });
   } catch (err) {
-    await client.query('ROLLBACK').catch(()=>{});
+    await client.query('ROLLBACK').catch(() => {});
     console.error('❌ /ingredients POST error:', err && (err.stack || err));
     return res.status(500).json({ success: false, message: 'Database error' });
   } finally {
@@ -1467,38 +1469,41 @@ app.put('/categories/:id', async (req, res) => {
 app.delete('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
   const force = String(req.query?.force || '').toLowerCase() === 'true';
-
   const client = await pool.connect();
+
   try {
     await client.query('BEGIN');
 
-    // list of common tables referencing ingredients; adjust to your schema if different
+    // ✅ Reference check: only tables that reference ingredient_id
     const checkTables = [
       'product_ingredients',
       'purchase_order_items',
       'ingredient_usage',
-      'ingredient_additions',
-      'refund_items',
-      'sale_items'  // correct table name
+      'ingredient_additions'
     ];
 
     const refCounts = {};
     for (const tbl of checkTables) {
       try {
-        const q = await client.query(`SELECT COUNT(*)::int AS cnt FROM ${tbl} WHERE ingredient_id = $1`, [id]);
+        const q = await client.query(
+          `SELECT COUNT(*)::int AS cnt FROM ${tbl} WHERE ingredient_id = $1`,
+          [id]
+        );
         refCounts[tbl] = Number(q.rows?.[0]?.cnt ?? 0);
       } catch (e) {
-        // table might not exist in some installs; treat as zero
         console.warn(`Reference-check skipped for table=${tbl}:`, e?.message || e);
         refCounts[tbl] = 0;
       }
     }
-    const totalRefs = Object.values(refCounts).reduce((a,b) => a + b, 0);
 
+    const totalRefs = Object.values(refCounts).reduce((a, b) => a + b, 0);
+
+    // ✅ Archive instead of delete (if referenced but not forced)
     if (totalRefs > 0 && !force) {
-      // archive instead of delete
-      await client.query(`ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS active boolean DEFAULT true`);
-      await client.query(`UPDATE ingredients SET active = false WHERE id = $1`, [id]);
+      await client.query(
+        `UPDATE ingredients SET active = false WHERE id = $1 AND (active IS NULL OR active = true)`,
+        [id]
+      );
       await client.query('COMMIT');
       return res.status(200).json({
         success: true,
@@ -1508,41 +1513,47 @@ app.delete('/ingredients/:id', async (req, res) => {
       });
     }
 
+    // ✅ Force delete (if referenced and force=true)
     if (totalRefs > 0 && force) {
-      // FORCE delete: remove referencing rows (destructive). Do in a defined order.
-      // WARNING: destructive. This will remove historical rows.
       const deleteTablesInOrder = [
-        'refund_items',
-        'sale_items',            // correct table name (was 'sales_items')
         'ingredient_usage',
         'ingredient_additions',
         'purchase_order_items',
         'product_ingredients'
       ];
+
       for (const tbl of deleteTablesInOrder) {
         try {
           await client.query(`DELETE FROM ${tbl} WHERE ingredient_id = $1`, [id]);
         } catch (e) {
           console.warn(`Force-delete: failed to DELETE from ${tbl}:`, e?.message || e);
-          // continue
         }
       }
     }
 
-    // finally delete ingredient
+    // ✅ Finally delete the ingredient record
     const del = await client.query('DELETE FROM ingredients WHERE id = $1', [id]);
     await client.query('COMMIT');
 
-    if (del.rowCount === 0) return res.status(404).json({ success: false, message: 'Ingredient not found' });
+    if (del.rowCount === 0)
+      return res.status(404).json({ success: false, message: 'Ingredient not found' });
+
     return res.json({ success: true, deleted: true, message: 'Ingredient deleted successfully' });
+
   } catch (err) {
-    await client.query('ROLLBACK').catch(()=>{});
+    await client.query('ROLLBACK').catch(() => {});
     console.error('DB Delete Error:', err && (err.stack || err));
-    return res.status(500).json({ success: false, message: 'Database error', error: String(err?.message || err) });
+    return res.status(500).json({
+      success: false,
+      message: 'Database error',
+      error: String(err?.message || err)
+    });
   } finally {
     client.release();
   }
 });
+
+
 
 app.get('/users', async (req, res) => {
   try {
