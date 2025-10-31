@@ -1553,14 +1553,25 @@ app.put('/ingredients/:id', async (req, res) => {
 app.delete('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
   try {
+    // Prevent accidental deletion if ingredient is used by any product
+    const ref = await pool.query('SELECT COUNT(*)::int AS cnt FROM product_ingredients WHERE ingredient_id = $1', [id]);
+    const cnt = Number(ref.rows?.[0]?.cnt ?? 0);
+    if (cnt > 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'Ingredient is referenced by product recipes. Remove it from products before deleting.',
+        references: { productIngredientCount: cnt }
+      });
+   }
+
     const result = await pool.query('DELETE FROM ingredients WHERE id = $1', [id]);
     if (result.rowCount === 0) {
       return res.status(404).json({ success: false, message: 'Ingredient not found' });
     }
-    res.json({ success: true, message: 'Ingredient deleted successfully' });
+    return res.json({ success: true, message: 'Ingredient deleted successfully' });
   } catch (err) {
-    console.error('❌ DB Delete Error:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
+   console.error('❌ DB Delete Error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Database error', error: String(err?.message || err) });
   }
 });
 
@@ -2166,6 +2177,66 @@ app.get("/purchase-orders/:id", async (req, res) => {
   } catch (err) {
     console.error("❌ /purchase-orders/:id error:", err && (err.stack || err));
     return res.status(500).json({ success: false, message: "Failed to fetch purchase order detail" });
+  }
+});
+app.post("/purchase-orders", async (req, res) => {
+  const { supplier_id = null, items = [], status = "pending", notes = null } = req.body || {};
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, message: "items must be a non-empty array" });
+  }
+
+  // validate items: expect { ingredientId, qty, unit?, unit_cost? }
+  for (const it of items) {
+    if (!it || !Number.isFinite(Number(it.ingredientId)) || !Number.isFinite(Number(it.qty))) {
+      return res.status(400).json({ success: false, message: "Each item must include numeric ingredientId and qty" });
+    }
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // compute total if unit_cost provided
+    let total = 0;
+    for (const it of items) {
+      const qty = Number(it.qty || 0);
+      const unitCost = Number(it.unit_cost ?? it.unitPrice ?? 0);
+      if (Number.isFinite(unitCost) && unitCost > 0) total += qty * unitCost;
+    }
+    total = Math.round((total + Number.EPSILON) * 100) / 100;
+
+    const poRes = await client.query(
+      `INSERT INTO purchase_orders (supplier_id, status, total, notes, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING id`,
+      [supplier_id, status, total, notes]
+    );
+    const poId = poRes.rows[0].id;
+
+    // insert items
+    const itemParams = [];
+    const itemPlaceholders = [];
+    items.forEach((it, idx) => {
+      const base = idx * 5;
+      // columns: po_id, ingredient_id, qty, unit, unit_cost
+      itemPlaceholders.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`);
+      itemParams.push(poId, Number(it.ingredientId), Number(it.qty), it.unit ?? null, (typeof it.unit_cost !== "undefined" ? it.unit_cost : (it.unitPrice ?? null)));
+    });
+
+    if (itemPlaceholders.length > 0) {
+      const sql = `INSERT INTO purchase_order_items (po_id, ingredient_id, qty, unit, unit_cost) VALUES ${itemPlaceholders.join(",")}`;
+      await client.query(sql, itemParams);
+    }
+
+    await client.query("COMMIT");
+    return res.json({ success: true, id: poId, message: "Purchase order created", total });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(()=>{});
+    console.error("❌ Error creating purchase order:", err && (err.stack || err));
+    return res.status(500).json({ success: false, message: "Failed to create purchase order", error: String(err && err.message || err) });
+  } finally {
+    client.release();
   }
 });
 
