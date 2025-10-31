@@ -140,6 +140,21 @@ const PORT = process.env.PORT || 3000;
   }
 })();
 
+// --- NEW: ensure ingredients.active + partial unique index (idempotent) ---
+(async function ensureIngredientActiveColumnAndIndex() {
+  try {
+    await pool.query(`ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS active boolean DEFAULT true`);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ingredients_active_unique_name
+      ON ingredients (LOWER(name))
+      WHERE active = true
+    `);
+    console.log('✅ ingredients.active column and partial unique index ensured');
+  } catch (err) {
+    console.error('❌ Failed ensuring ingredients.active/index:', err && (err.stack || err));
+  }
+})();
+
 pool.on("error", (err) => {
   console.error("POSTGRES POOL ERROR:", err && err.stack ? err.stack : err);
 });
@@ -833,6 +848,16 @@ app.post("/add-product", async (req, res) => {
 
     // Insert ingredients if any (store amount_unit if provided, else fallback to ingredient.unit via migration/backfill)
     if (Array.isArray(ingredients) && ingredients.length > 0) {
+      // Validate ingredient ids are active
+      const ingIds = ingredients.map(i => Number(i.id)).filter(Boolean);
+      if (ingIds.length > 0) {
+        const check = await client.query('SELECT id, active FROM ingredients WHERE id = ANY($1)', [ingIds]);
+        const inactive = (check.rows || []).filter(r => r.active === false).map(r => r.id);
+        if (inactive.length > 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, message: `Cannot use archived ingredient(s): ${inactive.join(', ')}` });
+        }
+      }
       for (const pi of ingredients) {
         const ingId = Number(pi.id);
         const amt = Number(pi.amount);
@@ -1036,10 +1061,9 @@ app.put("/products/:id", async (req, res) => {
 app.get('/ingredients', async (req, res) => {
   try {
     const sql = `
-      SELECT 
-        i.id, i.name, i.stock, i.unit, i.pieces_per_pack,
-        COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
-        COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
+      SELECT i.id, i.name, i.stock, i.unit, i.pieces_per_pack, i.active,
+             COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
+             COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
       FROM ingredients i
       ORDER BY LOWER(i.name)
     `;
@@ -1080,32 +1104,21 @@ app.put("/products/:id/ingredients", async (req, res) => {
     if (ingredients.length > 0) {
       const ids = ingredients.map((x) => Number(x.ingredientId));
       const ingrRes = await client.query(
-        `SELECT id, name, unit, piece_amount, piece_unit, pieces_per_pack FROM ingredients WHERE id = ANY($1)`,
+        `SELECT id, name, unit, piece_amount, piece_unit, pieces_per_pack, active FROM ingredients WHERE id = ANY($1)`,
         [ids]
       );
       const byId = {};
       for (const r of ingrRes.rows) byId[r.id] = r;
 
-      for (const ing of ingredients) {
-        const row = byId[Number(ing.ingredientId)];
-        if (!row) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({ success: false, message: `Ingredient id ${ing.ingredientId} not found` });
-        }
-        const prodUnit = ing.unit ?? row.unit;
-        const invUnit = row.unit;
-        // allow per-product pieces_per_pack submitted by client to be used for conversion check
-        const piecesPerPackForCheck = typeof ing.pieces_per_pack !== 'undefined' && ing.pieces_per_pack !== null
-          ? Number(ing.pieces_per_pack)
-          : (row.pieces_per_pack != null ? Number(row.pieces_per_pack) : null);
-
-        if (!canConvert(prodUnit, invUnit, { piece_amount: row.piece_amount, piece_unit: row.piece_unit, pieces_per_pack: piecesPerPackForCheck })) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            success: false,
-            message: `Incompatible unit for ingredient '${row.name}': product unit '${prodUnit}' cannot convert to inventory unit '${invUnit}'`
-          });
-        }
+      // ensure none of the requested ingredient ids point to archived ingredients
+      const inactive = ingrRes.rows.filter(r => r.active === false).map(r => r.id);
+      if (inactive.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          message: `Cannot use archived ingredient(s) in product: ${inactive.join(", ")}`,
+          inactive
+        });
       }
     }
 
@@ -1182,32 +1195,49 @@ app.put("/products/:id/ingredients", async (req, res) => {
 });
 
 // CREATE Ingredient
-app.post("/ingredients", async (req, res) => {
-  const { name, stock, unit, pieces_per_pack, piece_amount, piece_unit } = req.body;
+app.post('/ingredients', async (req, res) => {
+  const { name, unit = null, pieces_per_pack = null, stock = 0 } = req.body || {};
+  if (!name || !String(name).trim()) return res.status(400).json({ success: false, message: 'name is required' });
 
+  const client = await pool.connect();
   try {
-    // ✅ Case-insensitive check using ILIKE
-    const check = await pool.query(
-      "SELECT * FROM ingredients WHERE name ILIKE $1",
-      [name]
+    await client.query('BEGIN');
+    const normalized = String(name).trim();
+
+    const found = await client.query(
+      'SELECT id, active FROM ingredients WHERE LOWER(name) = LOWER($1) LIMIT 1',
+      [normalized]
     );
 
-    if (check.rows.length > 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Ingredient already exists" });
+    if (found.rows.length) {
+      const r = found.rows[0];
+      if (!r.active) {
+        await client.query(
+          `UPDATE ingredients
+           SET active = true, unit = $2, pieces_per_pack = $3, stock = COALESCE($4, stock)
+           WHERE id = $1`,
+          [r.id, unit, pieces_per_pack, stock]
+        );
+        await client.query('COMMIT');
+        return res.json({ success: true, id: r.id, reactivated: true, message: 'Ingredient reactivated' });
+      }
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'Ingredient with that name already exists' });
     }
 
-    // ✅ Insert new ingredient (pieces_per_pack optional)
-    await pool.query(
-      "INSERT INTO ingredients (name, stock, unit, pieces_per_pack, piece_amount, piece_unit) VALUES ($1, $2, $3, $4, $5, $6)",
-      [name, stock, unit, pieces_per_pack ?? null, piece_amount ?? null, piece_unit ?? null]
+    const ins = await client.query(
+      `INSERT INTO ingredients (name, unit, pieces_per_pack, stock, active)
+       VALUES ($1, $2, $3, $4, true) RETURNING id`,
+      [normalized, unit, pieces_per_pack, stock]
     );
-
-    res.json({ success: true });
+    await client.query('COMMIT');
+    return res.json({ success: true, id: ins.rows[0].id });
   } catch (err) {
-    console.error("❌ Error inserting ingredient:", err.message || err);
-    res.status(500).json({ success: false, message: "Database error" });
+    await client.query('ROLLBACK').catch(()=>{});
+    console.error('❌ /ingredients POST error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Database error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1422,10 +1452,9 @@ app.get('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
   try {
     const sql = `
-      SELECT 
-        i.id, i.name, i.stock, i.unit, i.pieces_per_pack,
-        COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
-        COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
+      SELECT i.id, i.name, i.stock, i.unit, i.pieces_per_pack, i.active,
+             COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
+             COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
       FROM ingredients i
       WHERE i.id = $1
       LIMIT 1
@@ -1438,6 +1467,7 @@ app.get('/ingredients/:id', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
+
 
 
 app.put('/ingredients/:id', async (req, res) => {
@@ -1508,7 +1538,6 @@ app.put('/ingredients/:id', async (req, res) => {
 app.delete('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    // check common referencing tables
     const checks = {
       product_ingredients: `SELECT COUNT(*)::int AS cnt FROM product_ingredients WHERE ingredient_id = $1`,
       purchase_order_items: `SELECT COUNT(*)::int AS cnt FROM purchase_order_items WHERE ingredient_id = $1`,
@@ -1525,19 +1554,18 @@ app.delete('/ingredients/:id', async (req, res) => {
     const totalRefs = Object.values(refCounts).reduce((a,b) => a + b, 0);
 
     if (totalRefs > 0) {
-      // Soft-delete: mark as inactive / archived so PO history stays intact
+      // mark as inactive/archive
       await pool.query(`ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS active boolean DEFAULT true`);
       await pool.query(`UPDATE ingredients SET active = false WHERE id = $1`, [id]);
-
       return res.status(200).json({
         success: true,
         archived: true,
-        message: 'Ingredient archived because it is referenced by other records. History preserved.',
+        message: 'Ingredient archived because it has related history. History preserved.',
         references: refCounts
       });
     }
 
-    // no references -> safe to delete
+    // no references -> safe delete
     const result = await pool.query('DELETE FROM ingredients WHERE id = $1', [id]);
     if (result.rowCount === 0) return res.status(404).json({ success: false, message: 'Ingredient not found' });
     return res.json({ success: true, message: 'Ingredient deleted successfully' });
@@ -1546,7 +1574,6 @@ app.delete('/ingredients/:id', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Database error', error: String(err?.message || err) });
   }
 });
-
 
 app.put('/users/:id', async (req, res) => {
   const { id } = req.params;
@@ -1758,19 +1785,16 @@ app.get('/ingredients/:id/additions', async (req, res) => {
   const { id } = req.params;
   const sql = `
     SELECT date, source, amount
-    FROM ingredient_additions
-    WHERE ingredient_id = $1
-    ORDER BY date DESC
   `;
+
   try {
     const result = await pool.query(sql, [id]);
     res.json(result.rows || []);
   } catch (err) {
-    console.error("❌ Error fetching additions:", err);
+       console.error("❌ Error fetching additions:", err);
     res.status(500).json({ success: false, message: "Database error" });
   }
 });
-
 
 app.get('/dashboard-summary', async (req, res) => {
   try {
