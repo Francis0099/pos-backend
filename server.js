@@ -146,7 +146,7 @@ const PORT = process.env.PORT || 3000;
     await pool.query(`ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS active boolean DEFAULT true`);
     await pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS ingredients_active_unique_name
-      ON ingredients (LOWER(name))
+      ON ingredients (LOWER(trim(name)))
       WHERE active = true
     `);
     console.log('✅ ingredients.active column and partial unique index ensured');
@@ -914,28 +914,43 @@ app.post("/add-product", async (req, res) => {
 
 app.delete("/products/:id", async (req, res) => {
   const { id } = req.params;
-
   try {
-    const result = await pool.query(
-      "DELETE FROM products WHERE id = $1",
-      [id]
-    );
-
-    if (result.rowCount > 0) {
-      return res.json({
-        success: true,
-        message: "Product deleted successfully",
-      });
-    } else {
-      return res
-        .status(404)
-        .json({ success: false, message: "Product not found" });
+    // tables to check for references; tolerate missing tables
+    const checkTables = [
+      'product_ingredients',
+      'sale_items',
+      'refund_items'
+    ];
+    const refCounts = {};
+    for (const tbl of checkTables) {
+      try {
+        const q = await pool.query(`SELECT COUNT(*)::int AS cnt FROM ${tbl} WHERE product_id = $1`, [id]);
+        refCounts[tbl] = Number(q.rows?.[0]?.cnt ?? 0);
+      } catch (e) {
+        console.warn(`Reference-check skipped for table=${tbl}:`, e?.message || e);
+        refCounts[tbl] = 0;
+      }
     }
+    const totalRefs = Object.values(refCounts).reduce((a,b) => a + b, 0);
+
+    if (totalRefs > 0) {
+      // Soft-delete (archive) product so history remains intact
+      await pool.query(`UPDATE products SET is_active = false WHERE id = $1`, [id]);
+      return res.status(200).json({
+        success: true,
+        archived: true,
+        message: 'Product archived because it has related records (history preserved).',
+        references: refCounts
+      });
+    }
+
+    // No references -> safe to delete
+    const result = await pool.query('DELETE FROM products WHERE id = $1', [id]);
+    if (result.rowCount === 0) return res.status(404).json({ success: false, message: 'Product not found' });
+    return res.json({ success: true, message: 'Product deleted successfully' });
   } catch (err) {
-    console.error("❌ Error deleting product:", err.message);
-    return res
-      .status(500)
-      .json({ success: false, message: "Database error", error: err.message });
+    console.error('❌ Product delete error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Database error', error: String(err?.message || err) });
   }
 });
 
@@ -1061,9 +1076,15 @@ app.put("/products/:id", async (req, res) => {
 app.get('/ingredients', async (req, res) => {
   try {
     const sql = `
-      SELECT i.id, i.name, i.stock, i.unit, i.pieces_per_pack, i.active,
-             COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
-             COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
+      SELECT 
+        i.id, i.name, i.stock, i.unit, i.pieces_per_pack, i.active,
+        COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
+        COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions,
+        -- count references from common tables so client knows if it can be deleted
+        COALESCE((SELECT COUNT(*) FROM product_ingredients WHERE ingredient_id = i.id), 0)
+        + COALESCE((SELECT COUNT(*) FROM purchase_order_items WHERE ingredient_id = i.id), 0)
+        + COALESCE((SELECT COUNT(*) FROM ingredient_usage WHERE ingredient_id = i.id), 0)
+        AS reference_count
       FROM ingredients i
       ORDER BY LOWER(i.name)
     `;
@@ -1196,7 +1217,7 @@ app.put("/products/:id/ingredients", async (req, res) => {
 
 // CREATE Ingredient
 app.post('/ingredients', async (req, res) => {
-  const { name, unit = null, pieces_per_pack = null, stock = 0 } = req.body || {};
+  const { name, unit = null, pieces_per_pack = null, stock = null, source = null } = req.body || {};
   if (!name || !String(name).trim()) return res.status(400).json({ success: false, message: 'name is required' });
 
   const client = await pool.connect();
@@ -1204,30 +1225,54 @@ app.post('/ingredients', async (req, res) => {
     await client.query('BEGIN');
     const normalized = String(name).trim();
 
+    // find any ingredient with same name (case-insensitive, trimmed)
     const found = await client.query(
-      'SELECT id, active FROM ingredients WHERE LOWER(name) = LOWER($1) LIMIT 1',
+      `SELECT id, active FROM ingredients WHERE LOWER(trim(name)) = LOWER(trim($1)) LIMIT 1`,
       [normalized]
     );
 
     if (found.rows.length) {
       const r = found.rows[0];
       if (!r.active) {
+        // reactivate archived record and update provided fields (unit/pieces_per_pack/stock)
         await client.query(
           `UPDATE ingredients
-           SET active = true, unit = $2, pieces_per_pack = $3, stock = COALESCE($4, stock)
+           SET name = $2,
+               unit = $3,
+               pieces_per_pack = $4,
+               stock = COALESCE($5, stock),
+               active = true
            WHERE id = $1`,
-          [r.id, unit, pieces_per_pack, stock]
+          [r.id, normalized, unit, pieces_per_pack, stock]
         );
+
+        // optionally add an ingredient_additions / initial stock record if source provided
+        if (stock !== null) {
+          try {
+            await client.query(
+              `INSERT INTO ingredient_additions (ingredient_id, amount, source, created_at)
+               VALUES ($1, $2, $3, NOW())`,
+              [r.id, stock, source || 'reactivate']
+            );
+          } catch (e) {
+            // non-fatal if table doesn't exist
+            console.warn('ingredient_additions insert skipped:', e?.message || e);
+          }
+        }
+
         await client.query('COMMIT');
         return res.json({ success: true, id: r.id, reactivated: true, message: 'Ingredient reactivated' });
       }
+
+      // already active -> conflict
       await client.query('ROLLBACK');
       return res.status(409).json({ success: false, message: 'Ingredient with that name already exists' });
     }
 
+    // insert new
     const ins = await client.query(
       `INSERT INTO ingredients (name, unit, pieces_per_pack, stock, active)
-       VALUES ($1, $2, $3, $4, true) RETURNING id`,
+       VALUES ($1, $2, $3, COALESCE($4, 0), true) RETURNING id`,
       [normalized, unit, pieces_per_pack, stock]
     );
     await client.query('COMMIT');
@@ -1391,7 +1436,7 @@ app.post('/categories', async (req, res) => {
   }
 });
 
-// ✅ Update category
+// ===== Fix: PUT /categories/:id error handling =========
 app.put('/categories/:id', async (req, res) => {
   const { id } = req.params;
   const { name } = req.body;
@@ -1413,159 +1458,48 @@ app.put('/categories/:id', async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error('❌ Category update error:', err.message || err);
-    res.status(500).json({ success: false, message: 'Database error' });
+    console.error('❌ /categories PUT error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Database error', error: String(err?.message || err) });
   }
 });
 
-// ✅ Delete category (block if referenced by products)
-app.delete('/categories/:id', async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    // Check if category is used by products
-    const refCheck = await pool.query(
-      `SELECT COUNT(*) AS cnt 
-       FROM products 
-       WHERE category = (SELECT name FROM categories WHERE id = $1)`,
-      [id]
-    );
-
-    if (refCheck.rows.length > 0 && Number(refCheck.rows[0].cnt) > 0) {
-      return res.status(409).json({ success: false, message: 'Category is used by products' });
-    }
-
-    const result = await pool.query('DELETE FROM categories WHERE id = $1', [id]);
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ success: false, message: 'Category not found' });
-    }
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('❌ Category delete error:', err.message || err);
-    res.status(500).json({ success: false, message: 'Database error' });
-  }
-});
-
-app.get('/ingredients/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const sql = `
-      SELECT i.id, i.name, i.stock, i.unit, i.pieces_per_pack, i.active,
-             COALESCE((SELECT SUM(amount_used) FROM ingredient_usage WHERE ingredient_id = i.id), 0) AS total_deductions,
-             COALESCE((SELECT SUM(amount) FROM ingredient_additions WHERE ingredient_id = i.id), 0) AS total_additions
-      FROM ingredients i
-      WHERE i.id = $1
-      LIMIT 1
-    `;
-    const result = await pool.query(sql, [id]);
-    if (!result.rows || result.rows.length === 0) return res.status(404).json({ success: false, message: 'Ingredient not found' });
-    return res.json(result.rows[0]);
-  } catch (err) {
-    console.error('❌ /ingredients/:id error:', err && (err.stack || err));
-    return res.status(500).json({ success: false, message: 'Database error' });
-  }
-});
-
-
-
-app.put('/ingredients/:id', async (req, res) => {
-  const { id } = req.params;
-  // accept optional pieces_per_pack (integer), piece_amount (number) and piece_unit (string)
-  const { name, stock, unit, source, pieces_per_pack, piece_amount, piece_unit } = req.body;
-
-  try {
-    const getSql = 'SELECT stock FROM ingredients WHERE id = $1';
-    const getResult = await pool.query(getSql, [id]);
-    if (getResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Ingredient not found' });
-    }
-    const oldStock = getResult.rows[0].stock;
-    const difference = stock - oldStock;
-
-    // validate pieces_per_pack when unit is 'pack'
-    if (String(unit).toLowerCase() === 'pack') {
-      const p = pieces_per_pack == null ? null : Number(pieces_per_pack);
-      if (!Number.isFinite(p) || p <= 0) {
-        return res.status(400).json({ success: false, message: 'pieces_per_pack must be a positive integer when unit is pack' });
-      }
-    }
-
-    const updateSql = `
-      UPDATE ingredients
-      SET name = $1,
-          stock = $2,
-          unit = $3,
-          pieces_per_pack = $4,
-          piece_amount = $5,
-          piece_unit = $6
-      WHERE id = $7
-    `;
-    await pool.query(updateSql, [
-      name,
-      stock,
-      unit,
-      pieces_per_pack ?? null,
-      typeof piece_amount !== 'undefined' ? (piece_amount === null ? null : Number(piece_amount)) : null,
-      piece_unit ?? null,
-      id,
-    ]);
-
-    if (difference > 0) {
-      // Log Restock
-      const additionSql = `
-        INSERT INTO ingredient_additions (ingredient_id, date, source, amount)
-        VALUES ($1, NOW(), $2, $3)
-      `;
-      await pool.query(additionSql, [id, source || 'Manual Update', difference]);
-    } else if (difference < 0) {
-      // Log Manual Deduction into ingredient_usage
-      const usageSql = `
-        INSERT INTO ingredient_usage (sale_id, product_id, ingredient_id, amount_used, created_at)
-        VALUES ($1, $2, $3, $4, NOW())
-      `;
-      await pool.query(usageSql, [null, null, id, Math.abs(difference)]);
-    }
-
-    res.json({ success: true, message: 'Ingredient updated successfully' });
-  } catch (err) {
-    console.error('❌ DB Update Error:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
-  }
-});
-
+// Replace /ingredients DELETE -> archive if refs exist; support ?force=true to hard-delete (destructive)
 app.delete('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
+  const force = String(req.query?.force || '').toLowerCase() === 'true';
+
+  const client = await pool.connect();
   try {
-    // tables to check for references (we tolerate missing tables)
+    await client.query('BEGIN');
+
+    // list of common tables referencing ingredients; adjust to your schema if different
     const checkTables = [
       'product_ingredients',
       'purchase_order_items',
       'ingredient_usage',
       'ingredient_additions',
-      'refund_items'
+      'refund_items',
+      'sale_items'  // correct table name
     ];
 
     const refCounts = {};
     for (const tbl of checkTables) {
       try {
-        const q = await pool.query(`SELECT COUNT(*)::int AS cnt FROM ${tbl} WHERE ingredient_id = $1`, [id]);
+        const q = await client.query(`SELECT COUNT(*)::int AS cnt FROM ${tbl} WHERE ingredient_id = $1`, [id]);
         refCounts[tbl] = Number(q.rows?.[0]?.cnt ?? 0);
       } catch (e) {
-        // table might not exist or query failed — log and treat as zero refs
+        // table might not exist in some installs; treat as zero
         console.warn(`Reference-check skipped for table=${tbl}:`, e?.message || e);
         refCounts[tbl] = 0;
       }
     }
+    const totalRefs = Object.values(refCounts).reduce((a,b) => a + b, 0);
 
-    const totalRefs = Object.values(refCounts).reduce((a, b) => a + b, 0);
-
-    if (totalRefs > 0) {
-      // soft-delete (archive) so history remains intact
-      await pool.query(`ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS active boolean DEFAULT true`);
-      await pool.query(`UPDATE ingredients SET active = false WHERE id = $1`, [id]);
-
+    if (totalRefs > 0 && !force) {
+      // archive instead of delete
+      await client.query(`ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS active boolean DEFAULT true`);
+      await client.query(`UPDATE ingredients SET active = false WHERE id = $1`, [id]);
+      await client.query('COMMIT');
       return res.status(200).json({
         success: true,
         archived: true,
@@ -1574,38 +1508,41 @@ app.delete('/ingredients/:id', async (req, res) => {
       });
     }
 
-    // no references -> safe to delete
-    const result = await pool.query('DELETE FROM ingredients WHERE id = $1', [id]);
-    if (result.rowCount === 0) return res.status(404).json({ success: false, message: 'Ingredient not found' });
-    return res.json({ success: true, message: 'Ingredient deleted successfully' });
+    if (totalRefs > 0 && force) {
+      // FORCE delete: remove referencing rows (destructive). Do in a defined order.
+      // WARNING: destructive. This will remove historical rows.
+      const deleteTablesInOrder = [
+        'refund_items',
+        'sale_items',            // correct table name (was 'sales_items')
+        'ingredient_usage',
+        'ingredient_additions',
+        'purchase_order_items',
+        'product_ingredients'
+      ];
+      for (const tbl of deleteTablesInOrder) {
+        try {
+          await client.query(`DELETE FROM ${tbl} WHERE ingredient_id = $1`, [id]);
+        } catch (e) {
+          console.warn(`Force-delete: failed to DELETE from ${tbl}:`, e?.message || e);
+          // continue
+        }
+      }
+    }
+
+    // finally delete ingredient
+    const del = await client.query('DELETE FROM ingredients WHERE id = $1', [id]);
+    await client.query('COMMIT');
+
+    if (del.rowCount === 0) return res.status(404).json({ success: false, message: 'Ingredient not found' });
+    return res.json({ success: true, deleted: true, message: 'Ingredient deleted successfully' });
   } catch (err) {
+    await client.query('ROLLBACK').catch(()=>{});
     console.error('DB Delete Error:', err && (err.stack || err));
     return res.status(500).json({ success: false, message: 'Database error', error: String(err?.message || err) });
+  } finally {
+    client.release();
   }
 });
-
-app.put('/users/:id', async (req, res) => {
-  const { id } = req.params;
-  const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ success: false, message: 'Username and password are required' });
-  }
-
-  try {
-    const sql = 'UPDATE users SET username = $1, password = $2 WHERE id = $3';
-    const result = await pool.query(sql, [username, password, id]);
-    if (result.rowCount > 0) {
-      res.json({ success: true, message: 'User updated successfully' });
-    } else {
-      res.status(404).json({ success: false, message: 'User not found' });
-    }
-  } catch (err) {
-    console.error('❌ Error updating user:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
-  }
-});
-
 
 app.get('/users', async (req, res) => {
   try {
@@ -1793,7 +1730,10 @@ app.get('/ingredients/:id/deductions', async (req, res) => {
 app.get('/ingredients/:id/additions', async (req, res) => {
   const { id } = req.params;
   const sql = `
-    SELECT date, source, amount
+    SELECT created_at AS date, source, amount
+    FROM ingredient_additions
+    WHERE ingredient_id = $1
+    ORDER BY created_at DESC
   `;
 
   try {
