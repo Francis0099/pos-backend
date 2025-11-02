@@ -2332,13 +2332,13 @@ app.delete("/purchase-orders/:id", async (req, res) => {
   try {
     await db.query("BEGIN");
 
-    // Delete items first
+    // 🔥 delete child rows using correct column name
     await db.query(
-      "DELETE FROM purchase_order_items WHERE purchase_order_id = $1",
+      "DELETE FROM purchase_order_items WHERE po_id = $1",
       [id]
     );
 
-    // Delete the purchase order
+    // ✅ delete the parent row
     const result = await db.query(
       "DELETE FROM purchase_orders WHERE id = $1 RETURNING *",
       [id]
@@ -2350,13 +2350,17 @@ app.delete("/purchase-orders/:id", async (req, res) => {
       return res.status(404).json({ error: "Purchase Order not found" });
     }
 
-    res.json({ message: "Purchase Order deleted successfully" });
+    return res.json({ message: "✅ Purchase Order deleted successfully" });
   } catch (error) {
     await db.query("ROLLBACK");
-    console.error("Delete error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("🔥 DELETE PO error:", error);
+    return res.status(500).json({
+      error: "Delete failed",
+      details: error.message || error
+    });
   }
 });
+
 
 app.post("/login-pin", async (req, res) => {
   try {
