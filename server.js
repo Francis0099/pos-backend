@@ -606,8 +606,9 @@ function convertToInventoryUnits(amount, productUnit, inventoryUnit, ingredientR
   const invU = normUnit(inventoryUnit);
 
   // try direct convert inventory -> product unit (mass/volume conversions)
-  const direct = convertSimple(amount, prodU, invU);
-  if (!Number.isNaN(direct)) return direct;
+const direct = convertSimple(inventoryAmount, inventoryUnit, productUnit);
+if (Number.isFinite(direct)) return direct;
+
 
   const pieceAmount = ingredientRow && ingredientRow.piece_amount != null ? Number(ingredientRow.piece_amount) : null;
   const pieceUnit = ingredientRow && ingredientRow.piece_unit ? String(ingredientRow.piece_unit) : null;
@@ -714,8 +715,9 @@ function canConvert(productUnit, inventoryUnit, ingredientRow = {}) {
 // ---------------------- add helper: inventory -> product units ----------------------
 function convertInventoryToProductUnits(inventoryAmount, inventoryUnit, productUnit, ingredientRow = {}) {
      // try direct convert inventory -> product unit
-     const direct = convertSimple(inventoryAmount, inventoryUnit, productUnit);
-     if (!Number.isNaN(direct)) return direct;
+   const direct = convertSimple(inventoryAmount, inventoryUnit, productUnit);
+if (Number.isFinite(direct)) return direct;
+
  
      const invU = normUnit(inventoryUnit);
      const prodU = normUnit(productUnit);
