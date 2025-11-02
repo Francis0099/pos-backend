@@ -1222,70 +1222,80 @@ app.put("/products/:id/ingredients", async (req, res) => {
 
 // CREATE Ingredient
 app.post('/ingredients', async (req, res) => {
-  const { name, unit = null, pieces_per_pack = null, stock = null, source = null } = req.body || {};
-  if (!name || !String(name).trim()) return res.status(400).json({ success: false, message: 'name is required' });
+  const name = req.body?.name ? String(req.body.name).trim() : null;
+  const unit = req.body?.unit ? String(req.body.unit).trim() : null;
+  const pieces_per_pack = req.body?.pieces_per_pack != null ? Number(req.body.pieces_per_pack) : null;
+  const stock = req.body?.stock != null ? Number(req.body.stock) : null;
+  const source = req.body?.source ? String(req.body.source) : null;
+
+  if (!name) return res.status(400).json({ success: false, message: 'name is required' });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query(`ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS active boolean DEFAULT true`);
 
-    const normalized = String(name).trim();
-
-    // find existing ingredient (case-insensitive)
     const found = await client.query(
-      `SELECT id, active FROM ingredients WHERE LOWER(trim(name)) = LOWER(trim($1)) LIMIT 1`,
-      [normalized]
+      `SELECT id, active FROM ingredients 
+       WHERE LOWER(trim(name)) = LOWER(trim($1)) LIMIT 1`,
+      [name]
     );
 
-if (found.rows.length) {
-  const r = found.rows[0];
-  if (!r.active) {
-    // Reactivate and restore UOM details
-    await client.query(
-      `UPDATE ingredients
-       SET name = $2,
-           unit = $3,
-           pieces_per_pack = CASE WHEN $3 = 'pack' THEN $4 ELSE NULL END,
-           piece_amount = CASE WHEN $3 = 'pack' THEN 1 ELSE NULL END,  -- default 1 piece per unit
-           piece_unit = CASE WHEN $3 = 'pack' THEN 'pieces' ELSE NULL END,
-           stock = COALESCE($5, stock),
-           active = true
-       WHERE id = $1`,
-      [r.id, normalized, unit, pieces_per_pack, stock]
+    if (found.rows.length) {
+      const r = found.rows[0];
+      if (!r.active) {
+        await client.query(
+          `UPDATE ingredients
+           SET name = $2,
+               unit = COALESCE($3::text, unit),
+               pieces_per_pack = CASE 
+                  WHEN COALESCE($3::text, unit) = 'pack' THEN $4 
+                  ELSE NULL 
+               END,
+               stock = COALESCE($5, stock),
+               active = true
+           WHERE id = $1`,
+          [r.id, name, unit, pieces_per_pack, stock]
+        );
+
+        await client.query('COMMIT');
+        return res.json({
+          success: true,
+          id: r.id,
+          reactivated: true,
+          message: 'Ingredient reactivated'
+        });
+      }
+
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        success: false,
+        message: 'Ingredient with that name already exists'
+      });
+    }
+
+    const ins = await client.query(
+      `INSERT INTO ingredients (name, unit, pieces_per_pack, stock, active)
+       VALUES ($1, $2::text, $3, COALESCE($4,0), true)
+       RETURNING id, name, unit, stock, active`,
+      [name, unit, pieces_per_pack, stock]
     );
 
     await client.query('COMMIT');
     return res.json({
       success: true,
-      id: r.id,
-      reactivated: true,
-      message: 'Ingredient reactivated'
+      ingredient: ins.rows[0],
+      message: 'Ingredient created'
     });
-  }
-
-  await client.query('ROLLBACK');
-  return res.status(409).json({ success: false, message: 'Ingredient with that name already exists' });
-}
-
-    // insert new ingredient
-    const ins = await client.query(
-      `INSERT INTO ingredients (name, unit, pieces_per_pack, stock, active)
-       VALUES ($1, $2, $3, COALESCE($4, 0), true)
-       RETURNING id, name, unit, stock, active`,
-      [normalized, unit, pieces_per_pack, stock]
-    );
-
-    await client.query('COMMIT');
-    return res.json({ success: true, ingredient: ins.rows[0], message: 'Ingredient created' });
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('❌ /ingredients POST error:', err && (err.stack || err));
+    await client.query('ROLLBACK');
+    console.error('❌ /ingredients POST error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   } finally {
     client.release();
   }
 });
+
 
 // ✅ Toggle product active/inactive (with message)
 app.put("/products/:id/toggle", async (req, res) => {
