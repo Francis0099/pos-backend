@@ -2332,13 +2332,11 @@ app.delete("/purchase-orders/:id", async (req, res) => {
   try {
     await pool.query("BEGIN");
 
-    // Delete items first
     await pool.query(
-      "DELETE FROM purchase_order_items WHERE purchase_order_id = $1",
+      "DELETE FROM purchase_order_items WHERE po_id = $1",
       [id]
     );
 
-    // Delete the purchase order
     const result = await pool.query(
       "DELETE FROM purchase_orders WHERE id = $1 RETURNING *",
       [id]
@@ -2350,11 +2348,11 @@ app.delete("/purchase-orders/:id", async (req, res) => {
       return res.status(404).json({ error: "Purchase Order not found" });
     }
 
-    return res.json({ message: "Purchase Order deleted successfully" });
+    res.json({ message: "Purchase Order deleted successfully" });
   } catch (error) {
     await pool.query("ROLLBACK");
     console.error("🔥 DELETE PO Error:", error.message || error);
-    return res.status(500).json({ error: "Internal server error", details: error.message });
+    res.status(500).json({ error: "Internal server error", details: error.message });
   }
 });
 
