@@ -2784,6 +2784,44 @@ app.get('/superadmin/list', verifySuperAdmin, async (req, res) => {
   }
 });
 
+app.put("/users/:id", async (req, res) => {
+  const userId = Number(req.params.id);
+  const { username, password, role } = req.body || {};
+
+  if (!username || !password) {
+    return res.status(400).json({ success: false, message: "Username and password required" });
+  }
+
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `UPDATE users
+       SET username = $1,
+           password = $2,
+           role = COALESCE($3, role)
+       WHERE id = $4
+       RETURNING id, username, role`,
+      [username.trim(), hashedPassword, role || null, userId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    res.json({
+      success: true,
+      message: "User updated successfully",
+      user: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error("⚠️ Update user error:", err.message);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
   console.log('Provider availability:', {
