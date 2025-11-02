@@ -1235,41 +1235,35 @@ app.post('/ingredients', async (req, res) => {
       [normalized]
     );
 
-    if (found.rows.length) {
-      const r = found.rows[0];
-      if (!r.active) {
-        // reactivate and update fields
-        await client.query(
-          `UPDATE ingredients
-           SET name = $2,
-               unit = $3,
-               pieces_per_pack = $4,
-               stock = COALESCE($5, stock),
-               active = true
-           WHERE id = $1`,
-          [r.id, normalized, unit, pieces_per_pack, stock]
-        );
+if (found.rows.length) {
+  const r = found.rows[0];
+  if (!r.active) {
+    // Reactivate and restore UOM details
+    await client.query(
+      `UPDATE ingredients
+       SET name = $2,
+           unit = $3,
+           pieces_per_pack = CASE WHEN $3 = 'pack' THEN $4 ELSE NULL END,
+           piece_amount = CASE WHEN $3 = 'pack' THEN 1 ELSE NULL END,  -- default 1 piece per unit
+           piece_unit = CASE WHEN $3 = 'pack' THEN 'pieces' ELSE NULL END,
+           stock = COALESCE($5, stock),
+           active = true
+       WHERE id = $1`,
+      [r.id, normalized, unit, pieces_per_pack, stock]
+    );
 
-        // optional log
-        if (stock !== null) {
-          try {
-            await client.query(
-              `INSERT INTO ingredient_additions (ingredient_id, amount, source, created_at)
-               VALUES ($1, $2, $3, NOW())`,
-              [r.id, stock, source || 'reactivate']
-            );
-          } catch (e) {
-            console.warn('ingredient_additions insert skipped:', e?.message || e);
-          }
-        }
+    await client.query('COMMIT');
+    return res.json({
+      success: true,
+      id: r.id,
+      reactivated: true,
+      message: 'Ingredient reactivated'
+    });
+  }
 
-        await client.query('COMMIT');
-        return res.json({ success: true, id: r.id, reactivated: true, message: 'Ingredient reactivated' });
-      }
-
-      await client.query('ROLLBACK');
-      return res.status(409).json({ success: false, message: 'Ingredient with that name already exists' });
-    }
+  await client.query('ROLLBACK');
+  return res.status(409).json({ success: false, message: 'Ingredient with that name already exists' });
+}
 
     // insert new ingredient
     const ins = await client.query(
