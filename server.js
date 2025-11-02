@@ -2746,6 +2746,26 @@ app.get('/superadmin/list', verifySuperAdmin, async (req, res) => {
   }
 });
 
+
+app.delete("/purchase-orders/:id", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await db.query(
+      "DELETE FROM purchase_orders WHERE id = $1 RETURNING *",
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Purchase Order not found" });
+    }
+
+    res.json({ message: "Purchase Order deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting purchase order:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
   console.log('Provider availability:', {
