@@ -1244,27 +1244,27 @@ app.post('/ingredients', async (req, res) => {
     if (found.rows.length) {
       const r = found.rows[0];
       if (!r.active) {
-        await client.query(
-          `UPDATE ingredients
-           SET name = $2,
-               unit = COALESCE($3::text, unit),
-               pieces_per_pack = CASE 
-                  WHEN COALESCE($3::text, unit) = 'pack' THEN $4 
-                  ELSE NULL 
-               END,
-               stock = COALESCE($5, stock),
-               active = true
-           WHERE id = $1`,
-          [r.id, name, unit, pieces_per_pack, stock]
-        );
+  await client.query(
+    `UPDATE ingredients
+     SET name = $2,
+         unit = COALESCE($3::text, unit),
+         pieces_per_pack = CASE 
+            WHEN COALESCE($3::text, unit) = 'pack' THEN CAST($4 AS integer)
+            ELSE NULL 
+         END,
+         stock = COALESCE($5, stock),
+         active = true
+     WHERE id = $1`,
+    [r.id, name, unit, pieces_per_pack, stock]
+  );
 
-        await client.query('COMMIT');
-        return res.json({
-          success: true,
-          id: r.id,
-          reactivated: true,
-          message: 'Ingredient reactivated'
-        });
+     await client.query('COMMIT');
+  return res.json({
+    success: true,
+    id: r.id,
+    reactivated: true,
+    message: 'Ingredient reactivated'
+  });
       }
 
       await client.query('ROLLBACK');
@@ -1274,12 +1274,12 @@ app.post('/ingredients', async (req, res) => {
       });
     }
 
-    const ins = await client.query(
-      `INSERT INTO ingredients (name, unit, pieces_per_pack, stock, active)
-       VALUES ($1, $2::text, $3, COALESCE($4,0), true)
-       RETURNING id, name, unit, stock, active`,
-      [name, unit, pieces_per_pack, stock]
-    );
+   const ins = await client.query(
+  `INSERT INTO ingredients (name, unit, pieces_per_pack, stock, active)
+   VALUES ($1, $2::text, CAST($3 AS integer), COALESCE($4,0), true)
+   RETURNING id, name, unit, stock, active`,
+  [name, unit, pieces_per_pack, stock]
+);
 
     await client.query('COMMIT');
     return res.json({
