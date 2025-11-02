@@ -606,7 +606,7 @@ function convertToInventoryUnits(amount, productUnit, inventoryUnit, ingredientR
   const invU = normUnit(inventoryUnit);
 
   // try direct convert inventory -> product unit (mass/volume conversions)
-const direct = convertSimple(inventoryAmount, inventoryUnit, productUnit);
+const direct = convertSimple(amount, prodU, invU);
 if (Number.isFinite(direct)) return direct;
 
 
@@ -663,6 +663,9 @@ if (Number.isFinite(direct)) return direct;
   // otherwise conversion not possible
   return NaN;
 }
+
+
+
 
 /**
  * Determine if a product-level unit can be converted to the ingredient inventory unit.
