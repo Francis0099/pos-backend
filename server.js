@@ -1719,31 +1719,30 @@ app.get("/sales-report", async (req, res) => {
 // ...existing code...
 app.get('/ingredient-usage-rows', async (req, res) => {
   try {
-    const todayOnly = String(req.query.today || "true").toLowerCase() === "true";
-    // if todayOnly use Manila local date comparison; otherwise (rare) return recent 7 days
-    const dateFilter = todayOnly
+    const todayOnly = String(req.query.today ?? "true").toLowerCase() === "true";
+
+    // Use Manila local date to match the client timezone checks
+    const whereClause = todayOnly
       ? `WHERE timezone('Asia/Manila', u.created_at)::date = (now() AT TIME ZONE 'Asia/Manila')::date`
-      : `WHERE timezone('Asia/Manila', u.created_at) >= (now() AT TIME ZONE 'Asia/Manila') - interval '7 days'`;
+      : ``;
 
     const sql = `
       SELECT
-        u.id,
-        u.created_at,
-        COALESCE(i.name, 'Unknown') AS ingredient,
-        u.amount_used AS amount,
-        COALESCE(i.unit, '') AS unit,
+        u.*,
+        i.name AS ingredient,
+        i.unit  AS ingredient_unit,
         i.pieces_per_pack
       FROM ingredient_usage u
       LEFT JOIN ingredients i ON u.ingredient_id = i.id
-      ${dateFilter}
+      ${whereClause}
       ORDER BY u.created_at DESC
     `;
-    console.log('GET /ingredient-usage-rows -> running SQL with todayOnly=', todayOnly);
+
+    console.log('[GET] /ingredient-usage-rows todayOnly=', todayOnly);
     const result = await pool.query(sql);
-    console.log(`GET /ingredient-usage-rows -> rows=${Array.isArray(result.rows) ? result.rows.length : 0}`);
     return res.json(Array.isArray(result.rows) ? result.rows : []);
   } catch (err) {
-    console.error('❌ /ingredient-usage-rows error:', err && (err.stack || err));
+    console.error('[GET] /ingredient-usage-rows error:', err && (err.stack || err));
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
