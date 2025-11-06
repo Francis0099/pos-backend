@@ -1704,6 +1704,30 @@ app.get("/sales-report", async (req, res) => {
   }
 });
 
+
+app.get('/ingredient-usage-rows', async (req, res) => {
+  try {
+    const sql = `
+      SELECT
+        u.created_at AS created_at,
+        i.name AS ingredient,
+        u.amount_used AS amount,
+        i.unit AS unit,
+        u.product_id,
+        u.sale_id
+      FROM ingredient_usage u
+      LEFT JOIN ingredients i ON u.ingredient_id = i.id
+      WHERE DATE(u.created_at) = CURRENT_DATE
+      ORDER BY u.created_at DESC
+    `;
+    const result = await pool.query(sql);
+    return res.json(Array.isArray(result.rows) ? result.rows : []);
+  } catch (err) {
+    console.error('❌ /ingredient-usage-rows error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
 // 📊 Ingredient usage summary report
 app.get("/ingredient-usage-report", async (req, res) => {
   const sql = `
