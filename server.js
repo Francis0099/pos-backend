@@ -222,7 +222,13 @@ app.get("/products-with-stock", async (req, res) => {
           // cannot convert -> treat as blocker (0 available)
           counts.push(0);
         } else {
-          const availableCount = Math.floor(invInProdUnits / prodAmount);
+          // Round up for piece/pack or piece/piece combinations (so 0.96 -> 1),
+          // otherwise keep conservative floor behaviour for continuous units.
+          const _pu = String(prodUnit || "").toLowerCase();
+          const _iu = String(invUnit || "").toLowerCase();
+          const availableCount = (_pu === "piece" && (_iu === "pack" || _iu === "piece"))
+            ? Math.ceil(invInProdUnits / prodAmount)
+            : Math.floor(invInProdUnits / prodAmount);
           counts.push(Number.isFinite(availableCount) ? Math.max(0, availableCount) : 0);
         }
       }
@@ -559,7 +565,13 @@ async function computeProductStock(productId, clientOrPool = pool) {
     if (!Number.isFinite(invInProdUnits)) {
       counts.push(0);
     } else {
-      const availableCount = Math.floor(invInProdUnits / prodAmount);
+      // Round up for piece/pack or piece/piece combinations (so 0.96 -> 1),
+      // otherwise keep conservative floor behaviour for continuous units.
+      const _pu = String(prodUnit || "").toLowerCase();
+      const _iu = String(invUnit || "").toLowerCase();
+      const availableCount = (_pu === "piece" && (_iu === "pack" || _iu === "piece"))
+        ? Math.ceil(invInProdUnits / prodAmount)
+        : Math.floor(invInProdUnits / prodAmount);
       counts.push(Number.isFinite(availableCount) ? Math.max(0, availableCount) : 0);
     }
   }
@@ -1163,7 +1175,7 @@ app.put("/products/:id/ingredients", async (req, res) => {
         const base = idx * 5;
         params.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`);
         // product_id, ingredient_id, amount_needed, amount_unit, pieces_per_pack
-        values.push(id, ing.ingredientId, Number(ing.amount), ing.unit ?? null, (typeof ing.pieces_per_pack !== 'undefined' ? ing.pieces_per_pack : null));
+        values.push(id, ing.ingredientId, Number(ing.amount), ing.unit ?? null, (typeof ing.pieces_per_pack !== 'undefined' && ing.pieces_per_pack !== null) ? Number(ing.pieces_per_pack) : null);
       });
 
       const sql = `
@@ -1295,7 +1307,6 @@ app.post('/ingredients', async (req, res) => {
     client.release();
   }
 });
-
 
 // ✅ Toggle product active/inactive (with message)
 app.put("/products/:id/toggle", async (req, res) => {
@@ -1563,7 +1574,6 @@ app.delete('/ingredients/:id', async (req, res) => {
 });
 
 
-
 app.get('/users', async (req, res) => {
   try {
     const sql = 'SELECT id, username, role FROM users';
@@ -1703,7 +1713,6 @@ app.get("/sales-report", async (req, res) => {
     res.status(500).json({ success: false, message: "Database error" });
   }
 });
-
 
 // ...existing code...
 app.get('/ingredient-usage-rows', async (req, res) => {
@@ -2616,8 +2625,18 @@ app.get('/products-split-stock', async (req, res) => {
           pieces_per_pack: r.pieces_per_pack
         });
 
-        if (!Number.isFinite(invInProdUnits)) counts.push(0);
-        else counts.push(Math.max(0, Math.floor(invInProdUnits / prodAmount)));
+        if (!Number.isFinite(invInProdUnits)) {
+          counts.push(0);
+        } else {
+          // Round up for piece/pack or piece/piece combinations (so 0.96 -> 1),
+          // otherwise keep conservative floor behaviour for continuous units.
+          const _pu = String(prodUnit || "").toLowerCase();
+          const _iu = String(invUnit || "").toLowerCase();
+          const availableCount = (_pu === "piece" && (_iu === "pack" || _iu === "piece"))
+            ? Math.ceil(invInProdUnits / prodAmount)
+            : Math.floor(invInProdUnits / prodAmount);
+          counts.push(Number.isFinite(availableCount) ? Math.max(0, availableCount) : 0);
+        }
       }
 
       const available = counts.length > 0 ? Math.min(...counts) : 0;
