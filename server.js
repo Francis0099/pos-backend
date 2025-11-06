@@ -219,9 +219,11 @@ app.get("/products-with-stock", async (req, res) => {
         });
 
         if (!Number.isFinite(invInProdUnits)) {
-          // cannot convert -> treat as blocker (0 available)
           counts.push(0);
         } else {
+          // ensure prodUnit/invUnit are defined from the row
+          const prodUnit = r.amount_unit || r.ingredient_unit;
+          const invUnit = r.ingredient_unit;
           // Round up for piece/pack or piece/piece combinations (so 0.96 -> 1),
           // otherwise keep conservative floor behaviour for continuous units.
           const _pu = String(prodUnit || "").toLowerCase();
@@ -647,7 +649,7 @@ if (Number.isFinite(direct)) return direct;
       if (!piecesPerPack) return NaN;
       return Number(amount) / piecesPerPack;
     }
-    if ((prodU === "g" || prodU === "kg" || prodU === "ml" || prodU === "l") && pieceAmount && pieceUnit && piecesPerPack) {
+    if ((prodU === "g" || prodU === "kg" || prodU === "ml" || invU === "l") && pieceAmount && pieceUnit && piecesPerPack) {
       // how much inventory in productUnit per pack
       const perPieceProdUnit = convertSimple(pieceAmount, pieceUnit, prodU);
       if (Number.isNaN(perPieceProdUnit)) return NaN;
@@ -2636,6 +2638,9 @@ app.get('/products-split-stock', async (req, res) => {
         if (!Number.isFinite(invInProdUnits)) {
           counts.push(0);
         } else {
+          // ensure prodUnit/invUnit are defined from the row
+          const prodUnit = r.amount_unit || r.ingredient_unit;
+          const invUnit = r.ingredient_unit;
           // Round up for piece/pack or piece/piece combinations (so 0.96 -> 1),
           // otherwise keep conservative floor behaviour for continuous units.
           const _pu = String(prodUnit || "").toLowerCase();
