@@ -1705,6 +1705,7 @@ app.get("/sales-report", async (req, res) => {
 });
 
 
+// ...existing code...
 app.get('/ingredient-usage-rows', async (req, res) => {
   try {
     const sql = `
@@ -1717,7 +1718,7 @@ app.get('/ingredient-usage-rows', async (req, res) => {
         u.sale_id
       FROM ingredient_usage u
       LEFT JOIN ingredients i ON u.ingredient_id = i.id
-      WHERE DATE(u.created_at) = CURRENT_DATE
+      WHERE timezone('Asia/Manila', u.created_at)::date = (now() AT TIME ZONE 'Asia/Manila')::date
       ORDER BY u.created_at DESC
     `;
     const result = await pool.query(sql);
@@ -1727,6 +1728,7 @@ app.get('/ingredient-usage-rows', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
+// ...existing code...
 
 // 📊 Ingredient usage summary report
 app.get("/ingredient-usage-report", async (req, res) => {
