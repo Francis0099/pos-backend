@@ -1766,23 +1766,24 @@ app.get("/ingredient-usage-report", async (req, res) => {
   }
 });
 
-app.get('/ingredients/:id', async (req, res) => {
-  const { id } = req.params;
+app.get("/ingredient-usage-report", async (req, res) => {
+  const sql = `
+-    SELECT i.name AS ingredient, i.unit, SUM(u.amount_used) AS total_used
+    -- ensure unit is never NULL/empty: prefer stored unit, otherwise default to 'pieces'
+    SELECT i.name AS ingredient,
+           COALESCE(NULLIF(TRIM(i.unit), ''), 'pieces') AS unit,
+           SUM(u.amount_used) AS total_used
+     FROM ingredient_usage u
+     JOIN ingredients i ON u.ingredient_id = i.id
+     GROUP BY u.ingredient_id, i.name, i.unit
+     ORDER BY total_used DESC;
+   `;
   try {
-    const result = await pool.query(
-      `SELECT id, name, stock, unit, pieces_per_pack, active
-       FROM ingredients
-       WHERE id = $1`,
-      [id]
-    );
-
-    if (result.rows.length === 0)
-      return res.status(404).json({ success: false, message: 'Ingredient not found' });
-
-    return res.json({ success: true, ingredient: result.rows[0] });
+    const result = await pool.query(sql);
+    res.json(result.rows || []);
   } catch (err) {
-    console.error('❌ /ingredients/:id error:', err && (err.stack || err));
-    return res.status(500).json({ success: false, message: 'Database error' });
+    console.error("❌ Error fetching ingredient usage report:", err);
+    res.status(500).json({ success: false, message: "Database error" });
   }
 });
 
