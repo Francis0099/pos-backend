@@ -1487,6 +1487,8 @@ app.put('/categories/:id', async (req, res) => {
   }
 });
 
+
+
 // Replace /ingredients DELETE -> archive if refs exist; support ?force=true to hard-delete (destructive)
 app.delete('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
@@ -1784,6 +1786,33 @@ app.get("/ingredient-usage-report", async (req, res) => {
   } catch (err) {
     console.error("❌ Error fetching ingredient usage report:", err);
     res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.get('/ingredients/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ success: false, message: 'Invalid id' });
+  try {
+    const sql = `
+      SELECT
+        id,
+        name,
+        COALESCE(stock, 0)::numeric AS stock,
+        COALESCE(unit, '') AS unit,
+        pieces_per_pack,
+        piece_amount,
+        piece_unit,
+        active
+      FROM ingredients
+      WHERE id = $1
+      LIMIT 1
+    `;
+    const result = await pool.query(sql, [id]);
+    if (!result.rows || result.rows.length === 0) return res.status(404).json({ success: false, message: 'Ingredient not found' });
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error('❌ /ingredients/:id error:', err && (err.stack || err));
+    return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
