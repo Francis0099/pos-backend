@@ -1487,8 +1487,6 @@ app.put('/categories/:id', async (req, res) => {
   }
 });
 
-
-
 // Replace /ingredients DELETE -> archive if refs exist; support ?force=true to hard-delete (destructive)
 app.delete('/ingredients/:id', async (req, res) => {
   const { id } = req.params;
@@ -1599,21 +1597,22 @@ app.get('/best-sellers', async (req, res) => {
     const y = year ? Number(year) : target.getFullYear();
 
     let sql = `
-      SELECT
+       SELECT
         p.id,
         p.name,
         p.photo,
-        SUM( GREATEST(si.quantity - COALESCE(ri.refunded_qty,0), 0) )::int AS total_sold
+      SUM( GREATEST(si.quantity - COALESCE(ri.refunded_qty,0), 0) )::int AS total_sold
       FROM sale_items si
       JOIN sales s ON s.id = si.sale_id
-      JOIN products p ON p.id = si.product_id
-      LEFT JOIN (
-        SELECT r.sale_id, ri.product_id, SUM(ri.quantity)::int AS refunded_qty
-        FROM refund_items ri
-        JOIN refunds r ON r.id = ri.refund_id
-        GROUP BY r.sale_id, ri.product_id
-      ) ri ON ri.sale_id = si.sale_id AND ri.product_id = si.product_id
-      WHERE EXTRACT(YEAR FROM s.created_at) = $1 AND EXTRACT(MONTH FROM s.created_at) = $2
+       JOIN products p ON p.id = si.product_id
+       LEFT JOIN (
+         SELECT r.sale_id, ri.product_id, SUM(ri.quantity)::int AS refunded_qty
+         FROM refund_items ri
+         JOIN refunds r ON r.id = ri.refund_id
+         GROUP BY r.sale_id, ri.product_id
+       ) ri ON ri.sale_id = si.sale_id AND ri.product_id = si.product_id
+        WHERE EXTRACT(YEAR FROM timezone('Asia/Manila', s.created_at)) = $1
+        AND EXTRACT(MONTH FROM timezone('Asia/Manila', s.created_at)) = $2
     `;
     const params = [y, m];
 
@@ -1862,8 +1861,10 @@ app.get('/ingredients/:id/additions', async (req, res) => {
 app.get('/dashboard-summary', async (req, res) => {
   try {
     // Total sales amount today
-    const salesResult = await pool.query(
-      'SELECT COALESCE(SUM(total_amount), 0) AS total FROM sales WHERE DATE(created_at) = CURRENT_DATE'
+      const salesResult = await pool.query(
+      `SELECT COALESCE(SUM(total_amount), 0) AS total
+       FROM sales
+       WHERE (timezone('Asia/Manila', created_at))::date = (now() AT TIME ZONE 'Asia/Manila')::date`
     );
     const totalSalesToday = Number(salesResult.rows[0]?.total || 0);
 
@@ -1883,13 +1884,11 @@ app.get('/dashboard-summary', async (req, res) => {
 
     // Best seller today
     const bestResult = await pool.query(`
-
       SELECT p.id, p.name, SUM(si.quantity) AS total_sold
-
       FROM sale_items si
       JOIN sales s ON s.id = si.sale_id
       JOIN products p ON p.id = si.product_id
-      WHERE DATE(s.created_at) = CURRENT_DATE
+      WHERE (timezone('Asia/Manila', s.created_at))::date = (now() AT TIME ZONE 'Asia/Manila')::date
       GROUP BY p.id, p.name
       ORDER BY total_sold DESC
       LIMIT 1
@@ -1921,21 +1920,21 @@ app.get('/sales-trend', async (req, res) => {
     let orderBy = '';
     const params = [];
 
-    if (period === 'day') {
-      where = 'WHERE DATE(s.created_at) = CURRENT_DATE';
-      selectTime = 'EXTRACT(HOUR FROM s.created_at) AS bucket';
-      groupBy = 'GROUP BY EXTRACT(HOUR FROM s.created_at)';
-      orderBy = 'ORDER BY EXTRACT(HOUR FROM s.created_at) ASC';
+     if (period === 'day') {
+       where = `WHERE (timezone('Asia/Manila', s.created_at))::date = (now() AT TIME ZONE 'Asia/Manila')::date`;
+      selectTime = `EXTRACT(HOUR FROM timezone('Asia/Manila', s.created_at)) AS bucket`;
+      groupBy = `GROUP BY EXTRACT(HOUR FROM timezone('Asia/Manila', s.created_at))`;
+      orderBy = `ORDER BY EXTRACT(HOUR FROM timezone('Asia/Manila', s.created_at)) ASC`;
     } else if (period === 'week') {
-      where = "WHERE s.created_at >= CURRENT_DATE - INTERVAL '6 days'";
-      selectTime = 'DATE(s.created_at) AS bucket';
-      groupBy = 'GROUP BY DATE(s.created_at)';
-      orderBy = 'ORDER BY DATE(s.created_at) ASC';
+      where = `WHERE (timezone('Asia/Manila', s.created_at))::date >= (now() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '6 days'`;
+      selectTime = `timezone('Asia/Manila', s.created_at)::date AS bucket`;
+      groupBy = `GROUP BY timezone('Asia/Manila', s.created_at)::date`;
+      orderBy = `ORDER BY timezone('Asia/Manila', s.created_at)::date ASC`;
     } else {
-      where = "WHERE s.created_at >= CURRENT_DATE - INTERVAL '29 days'";
-      selectTime = 'DATE(s.created_at) AS bucket';
-      groupBy = 'GROUP BY DATE(s.created_at)';
-      orderBy = 'ORDER BY DATE(s.created_at) ASC';
+      where = `WHERE (timezone('Asia/Manila', s.created_at))::date >= (now() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '29 days'`;
+      selectTime = `timezone('Asia/Manila', s.created_at)::date AS bucket`;
+      groupBy = `GROUP BY timezone('Asia/Manila', s.created_at)::date`;
+      orderBy = `ORDER BY timezone('Asia/Manila', s.created_at)::date ASC`;
     }
 
     let productFilter = '';
