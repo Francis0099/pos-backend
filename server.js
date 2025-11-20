@@ -1646,7 +1646,8 @@ app.get("/sales-report", async (req, res) => {
     if (period === "day") {
       bucketExpr = "to_char(timezone('Asia/Manila', s.created_at), 'YYYY-MM-DD')";
     } else if (period === "week") {
-      bucketExpr = "to_char(timezone('Asia/Manila', date_trunc('week', s.created_at)), 'YYYY-MM-DD')";
+      // truncate to Manila-week start then format (timezone MUST be applied first)
+      bucketExpr = "to_char(date_trunc('week', timezone('Asia/Manila', s.created_at)), 'YYYY-MM-DD')";
     } else {
       bucketExpr = "to_char(timezone('Asia/Manila', s.created_at), 'YYYY-MM')";
     }
@@ -1663,7 +1664,7 @@ app.get("/sales-report", async (req, res) => {
       JOIN sales s ON si.sale_id = s.id
       JOIN products p ON si.product_id = p.id
       ${whereRecent}
-      GROUP BY bucket, p.name
+      GROUP BY ${bucketExpr}, p.name
       ORDER BY bucket ASC, total_sold DESC
     `;
 
@@ -1931,6 +1932,7 @@ app.get('/sales-trend', async (req, res) => {
       groupBy = `GROUP BY timezone('Asia/Manila', s.created_at)::date`;
       orderBy = `ORDER BY timezone('Asia/Manila', s.created_at)::date ASC`;
     } else {
+      
       where = `WHERE (timezone('Asia/Manila', s.created_at))::date >= (now() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '29 days'`;
       selectTime = `timezone('Asia/Manila', s.created_at)::date AS bucket`;
       groupBy = `GROUP BY timezone('Asia/Manila', s.created_at)::date`;
